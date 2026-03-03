@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Privacy & GDPR – 1079Magic</title>
+
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+
+<style>
+  /* ------------------------------------------------------------------
+     GLOBAL THEME — Same as main app
+  ------------------------------------------------------------------ */
+  :root {
+    --bg:#0f1116;
+    --panel:#1a1d24;
+    --text:#e8eaed;
+    --muted:#9aa4b2;
+    --border:#2d3340;
+    --accent:#3b82f6;
+    --accent-hover:#2563eb;
+  }
+
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+
+    /* Background image + shading overlay */
+    background:
+      linear-gradient(rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.65)), /* shading */
+      url('3851.jpg');  /* your uploaded Bear image */
+
+    background-size: cover;         /* fills whole screen */
+    background-position: center;    /* centers the bear nicely */
+    background-repeat: no-repeat;
+    background-attachment: fixed;   /* parallax-style effect */
+
+    color: var(--text);
+  }
+
+
+  /* ------------------------------------------------------------------
+     HEADER BAR — identical to main page, no image/title
+  ------------------------------------------------------------------ */
+  .header-wrapper {
+    background: linear-gradient(
+      180deg,
+      #a71930 0%,
+      #9a172c 10%,
+      #8c1527 20%,
+      #7f1323 30%,
+      #72111f 40%,
+      #650f1b 50%,
+      #570d16 60%,
+      #4a0b12 70%,
+      #3d090e 80%,
+      #2f0709 90%,
+      #220505 100%
+    );
+    height: 90px;
+    width: 100%;
+    box-shadow:
+      0 0 40px rgba(0, 0, 0, 0.7),
+      0 15px 30px rgba(0, 0, 0, 0.6),
+      inset 0 1px 0 rgba(255,255,255,0.08),
+      inset 0 -15px 25px rgba(0,0,0,0.5);
+  }
+
+  /* ------------------------------------------------------------------
+     PAGE LAYOUT — identical to main app
+  ------------------------------------------------------------------ */
+  .container {
+    max-width: 1250px;
+    margin: auto;
+    padding: 24px 16px 60px;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.35);
+    margin-top: 20px;
+  }
+
+  h1 {
+    color: var(--accent);
+    margin-top: 0;
+    margin-bottom: 20px;
+    font-size: 1.9rem;
+  }
+
+  h2 {
+    color: var(--muted);
+    margin-top: 28px;
+    margin-bottom: 10px;
+    font-size: 1.3rem;
+  }
+
+  p, li {
+    line-height: 1.6;
+    font-size: 1.05rem;
+  }
+
+  a {
+    color: var(--accent);
+  }
+
+  /* ------------------------------------------------------------------
+     FLOATING BACK BUTTON
+  ------------------------------------------------------------------ */
+  .back-floating {
+    position: fixed;
+    top: 18px;
+    left: 18px;
+    z-index: 9999;
+    background: linear-gradient(180deg, #3b82f6, #2563eb);
+    color: white;
+    padding: 10px 16px;
+    font-size: 0.95rem;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    box-shadow:0 4px 10px rgba(0,0,0,0.4);
+    display:flex;
+    align-items:center;
+    gap:6px;
+    transition: transform 0.15s ease-out, box-shadow 0.2s ease-out;
+  }
+
+  .back-floating:hover {
+    transform: scale(1.07);
+    box-shadow: 0 0 14px #3b82f6;
+  }
+
+  .back-floating:active {
+    transform: scale(0.97);
+  }
+
+  /* ------------------------------------------------------------------
+     MOBILE FIXES — readable text
+  ------------------------------------------------------------------ */
+  @media (max-width: 768px) {
+    h1 { font-size: 1.6rem; }
+    h2 { font-size: 1.2rem; }
+    p, li { font-size: 1rem; }
+    .panel { padding: 18px; }
+  }
+
+  @media (max-width: 480px) {
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.15rem; }
+    p, li { font-size: 0.95rem; }
+    .panel { padding: 16px; }
+
+    .back-floating {
+      top: 12px;
+      left: 12px;
+      padding: 8px 12px;
+      font-size: 0.82rem;
+    }
+  }
+</style>
+</head>
+
+<body>
+
+<div class="header-wrapper"></div>
+
+<button class="back-floating" onclick="safeBack()">← Back</button>
+
+<div class="container">
+  <div class="panel">
+
+    <h1>Privacy & GDPR Notice</h1>
+
+    <p>
+      1079Magic respects your privacy. This tool does not collect, store, or process
+      any personal data. No login, account creation, or personal identification is required.
+    </p>
+
+    <h2>What Data Is Not Collected</h2>
+    <ul>
+      <li>No personal information</li>
+      <li>No email, IP logging, or identifiers</li>
+      <li>No tracking of player activity or performance</li>
+      <li>No analytics unless explicitly enabled by Netlify</li>
+    </ul>
+
+    <h2>Third‑Party Services</h2>
+    <p>
+      1079Magic is hosted on <strong>Netlify</strong>.
+      Netlify may automatically log basic technical data (server logs).
+      These logs are not controlled or accessed by 1079Magic.
+    </p>
+
+    <p>No cookies, trackers, or marketing tools are intentionally implemented.</p>
+
+    <h2>Your GDPR Rights</h2>
+    <p>
+      Since this site does not collect personal data,
+      GDPR requests (access, deletion, rectification) are generally not applicable.
+      If you have privacy concerns, please contact:
+    </p>
+
+    <p>
+      <a href="mailto:egon.hadzisejdic1@gmail.com">
+        egon.hadzisejdic1@gmail.com
+      </a>
+    </p>
+
+  </div>
+</div>
+
+<script>
+function safeBack() {
+  if (window.history.length > 1) history.back();
+  else window.location.href = "/index.html";
+}
+</script>
+
+</body>
+</html>

@@ -1,0 +1,29 @@
+# ===========================
+# robots.txt for 1079magic.netlify.app
+# Security‑focused configuration
+# ===========================
+
+User-agent: *
+# Disallow access to sensitive or internal folders
+Disallow: /admin/
+Disallow: /config/
+Disallow: /internal/
+Disallow: /private/
+Disallow: /secure/
+Disallow: /api/
+Disallow: /functions/
+Disallow: /.netlify/
+
+# Disallow crawling of JS source files to reduce code scraping
+Disallow: /app1.js
+Disallow: /app2.js
+Disallow: /tiers.json
+
+# Allow public pages
+Allow: /
+
+# Prevent search engines from storing cached copies
+Noarchive: /
+
+# Sitemap (optional, but recommended if you add one)
+# Sitemap: https://1079magic.netlify.app/sitemap.xml
