@@ -907,10 +907,29 @@
         </div>
       </div>
     </div>
+    <div class="grid" style="margin-top:10px;">
 
-    <label>Manual Call Rally composition (Inf/Cav/Arc) <span class="tooltip-icon" data-tooltip="Optional: Override auto ratios (e.g. 5/15/80 = 5% Inf, 15% Cav, 80% Arch)">?</span></label>
-    <input id="compInput" type="text" placeholder="e.g. 5/15/80">
-    <div id="compHint" class="muted" style="margin-top:6px"></div>
+      <div>
+        <label>
+          Manual <strong>Call</strong> Rally composition (Inf/Cav/Arc)
+          <span class="tooltip-icon"
+                data-tooltip="Optional: Override auto ratios (e.g. 5/15/80 = 5% Inf, 15% Cav, 80% Arch)">?</span>
+        </label>
+        <input id="compInput" type="text" placeholder="e.g. 5/15/80">
+        <div id="compHint" class="muted" style="margin-top:6px"></div>
+      </div>
+
+      <div>
+        <label>
+          Manual <strong>Join</strong> Rally composition (Inf/Cav/Arc)
+          <span class="tooltip-icon"
+                data-tooltip="Optional: Override join march ratios (e.g. 5/20/75)">?</span>
+        </label>
+        <input id="compInputJoin" type="text" placeholder="e.g. 5/20/75">
+        <div id="compHintJoin" class="muted" style="margin-top:6px"></div>
+      </div>
+
+    </div>
     <div class="grid" style="margin-top:20px;">
       <div class="help-box collapsed">
         <div class="help-title">💡 What is <strong>Magic Ratio?</strong></div>
@@ -1010,7 +1029,7 @@
           </div>
         </div>
       </div>
-    </div>
+    </div>  
 
 
     <!-- Readouts -->
@@ -1162,7 +1181,7 @@
   const WATCH_IDS = [
     'inf_atk', 'inf_let', 'cav_atk', 'cav_let', 'arc_atk', 'arc_let',
     'troopTier', 'stockInf', 'stockCav', 'stockArc',
-    'rallySize', 'marchSize', 'numFormations', 'compInput'
+    'rallySize', 'marchSize', 'numFormations', 'compInput', 'compInputJoin'
   ];
 
   // ========== Loading Indicator Control ==========
@@ -1356,6 +1375,7 @@
   function initPage() {
     restoreState();
     attachInputListeners();
+    
     setupButtonListeners();
     setupHelpToggles();
 
