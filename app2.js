@@ -140,6 +140,21 @@
       return lastBestTriplet;
     }
   }
+  function getJoinFractionsManual() {
+    const el = document.getElementById("compInputJoin");
+    const hint = document.getElementById("compHintJoin");
+    if (!el) return null;
+
+    const parsed = parseCompToFractions(el.value);
+    if (parsed) {
+        const disp = formatTriplet(parsed.fin, parsed.fcav, parsed.farc);
+        if (hint) hint.textContent = `Using: ${disp}`;
+        return parsed;
+    } else {
+        if (hint) hint.textContent = `Invalid input → using engine logic`;
+        return null;
+    }
+  }
 
   // ---------- Plot Rendering ----------
   function percentile(arr, p) {
@@ -253,52 +268,122 @@
     updateRecommendedDisplay();
   }
 
-  // ---------- Rally Build (arc → cav → inf priority) ----------
-  function buildRally(fractions, rallySize, stock) {
-    if (rallySize <= 0) return { inf:0, cav:0, arc:0 };
-    const iMin = Math.ceil(INF_MIN_PCT * rallySize);
-    const iMax = Math.floor(INF_MAX_PCT * rallySize);
-    const cMin = Math.ceil(CAV_MIN_PCT * rallySize);
+// ---------- Rally Build (RESPECT MANUAL FRACTIONS) ----------
+function buildRally(fractions, rallySize, stock) {
 
-    // Step 1: max archers
-    let a = Math.min(stock.arc, rallySize);
-    let used = a;
+  if (rallySize <= 0)
+    return { inf: 0, cav: 0, arc: 0 };
 
-    // Step 2: max cavalry
-    let c = Math.min(stock.cav, Math.max(0, rallySize - used));
-    used += c;
+  // Extract user fractions
+  let fInf = fractions.fin;
+  let fCav = fractions.fcav;
+  let fArc = fractions.farc;
 
-    // Step 3: infantry fills rest
-    let i = Math.min(stock.inf, Math.max(0, rallySize - used));
-    used += i;
+  // Compute ideal troop counts from fractions
+  let idealInf = Math.round(fInf * rallySize);
+  let idealCav = Math.round(fCav * rallySize);
+  let idealArc = Math.round(fArc * rallySize);
 
-    // Enforce min infantry (swap from arc first, then cav)
-    if (i < iMin) {
-      const need = iMin - i;
-      const fromArc = Math.min(a, need);
-      a -= fromArc; i += fromArc;
-      const still = iMin - i;
-      if (still > 0) { const fromCav = Math.min(c, still); c -= fromCav; i += fromCav; }
+  // Ensure we do not exceed available stock
+  let inf = Math.min(stock.inf, idealInf);
+  let cav = Math.min(stock.cav, idealCav);
+  let arc = Math.min(stock.arc, idealArc);
+
+  // Fix rounding deficit (under-filled rally)
+  let used = inf + cav + arc;
+  if (used < rallySize) {
+    let deficit = rallySize - used;
+
+    // Priority to the highest fraction type
+    const order = [
+      ["arc", fArc],
+      ["cav", fCav],
+      ["inf", fInf]
+    ].sort((a, b) => b[1] - a[1]); // highest first
+
+    for (const [type] of order) {
+      if (deficit <= 0) break;
+      let free = stock[type] - ({inf, cav, arc}[type]);
+      if (free > 0) {
+        const add = Math.min(free, deficit);
+        if (type === "inf") inf += add;
+        if (type === "cav") cav += add;
+        if (type === "arc") arc += add;
+        deficit -= add;
+      }
     }
-    // Enforce max infantry
-    if (i > iMax) {
-      const excess = i - iMax;
-      const toArc = Math.min(excess, stock.arc - a);
-      a += toArc; i -= toArc;
-      const still = i - iMax;
-      if (still > 0) { c += still; i -= still; }
-    }
-    // Enforce min cavalry (swap from arc)
-    if (c < cMin) {
-      const need = cMin - c;
-      const fromArc = Math.min(a, need);
-      a -= fromArc; c += fromArc;
-    }
-
-    stock.inf -= i; stock.cav -= c; stock.arc -= a;
-    return { inf: i, cav: c, arc: a };
   }
 
+  // ================================
+  // ENFORCE GAME BOUND RULES
+  // ================================
+  const iMin = Math.ceil(INF_MIN_PCT * rallySize);
+  const iMax = Math.floor(INF_MAX_PCT * rallySize);
+  const cMin = Math.ceil(CAV_MIN_PCT * rallySize);
+
+  // --- Enforce minimum infantry ---
+  if (inf < iMin) {
+    let need = iMin - inf;
+
+    // Try swap from arc
+    let fromArc = Math.min(arc, need);
+    arc -= fromArc; inf += fromArc; need -= fromArc;
+
+    // Try swap from cav
+    if (need > 0) {
+      let fromCav = Math.min(cav, need);
+      cav -= fromCav; inf += fromCav; need -= fromCav;
+    }
+  }
+
+  // --- Enforce maximum infantry ---
+  if (inf > iMax) {
+    let excess = inf - iMax;
+
+    let toArc = Math.min(excess, stock.arc - arc);
+    arc += toArc; inf -= toArc; excess -= toArc;
+
+    if (excess > 0) {
+      cav += excess;
+      inf -= excess;
+    }
+  }
+
+  // --- Enforce minimum cavalry ---
+  if (cav < cMin) {
+    let need = cMin - cav;
+    let fromArc = Math.min(arc, need);
+    arc -= fromArc; cav += fromArc;
+  }
+
+  // Deduct from stock
+  stock.inf -= inf;
+  stock.cav -= cav;
+  stock.arc -= arc;
+
+  return { inf, cav, arc };
+}
+  function buildJoinManually(stock, marchCount, cap, fractions) {
+    const packs = [];
+
+    for (let m = 0; m < marchCount; m++) {
+        let i = Math.round(fractions.fin * cap);
+        let c = Math.round(fractions.fcav * cap);
+        let a = Math.round(fractions.farc * cap);
+
+        i = Math.min(i, stock.inf);
+        c = Math.min(c, stock.cav);
+        a = Math.min(a, stock.arc);
+
+        stock.inf -= i;
+        stock.cav -= c;
+        stock.arc -= a;
+
+        packs.push({ inf: i, cav: c, arc: a });
+    }
+
+    return { packs, leftover: stock };
+}
   // ---------- Round Robin ----------
   function fillRoundRobin(total, caps) {
     const n = caps.length;
@@ -460,7 +545,18 @@
     const rally = buildRally(usedFractions, rallySize, stock);
     const rallyTotal = rally.inf + rally.cav + rally.arc;
 
-    const { packs, leftover } = buildOptionAFormations({ ...stock }, formations, cap);
+    let joinFractionsManual = getJoinFractionsManual();
+
+    let result;
+    if (joinFractionsManual) {
+        // NEW: manual override for JOIN marches
+        result = buildJoinManually({ ...stock }, formations, cap, joinFractionsManual);
+    } else {
+        // existing logic
+        result = buildOptionAFormations({ ...stock }, formations, cap);
+    }
+
+    const { packs, leftover } = result;
 
     // table
     let html = `<table><thead>
