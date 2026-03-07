@@ -45,7 +45,17 @@
 
     color: var(--text);
   }
-
+   /* FIX 3: On mobile, background-attachment:fixed causes gaps/white areas.
+     Use scroll + cover so image always fills the screen with no white space.
+     Also disable the zoom animation on mobile as percentage-based sizes
+     can expose edges on small screens. */
+  @media (max-width: 768px) {
+    body {
+      background-attachment: scroll;
+      background-size: cover !important;
+      animation: none;
+    }
+  }
 
   /* ------------------------------------------------------------------
      HEADER BAR — identical to main page, no image/title
@@ -231,4 +241,5 @@ function safeBack() {
 </body>
 
 </html>
+
 
