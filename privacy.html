@@ -24,7 +24,11 @@
     --accent:#3b82f6;
     --accent-hover:#2563eb;
   }
-
+  /* FIX 2: Set html background to dark so fast-scroll overscroll never shows white */
+    html {
+      background-color: #0f1116;
+      height: 100%;
+    }
   body {
     margin: 0;
     font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
@@ -227,3 +231,4 @@ function safeBack() {
 </body>
 
 </html>
+
