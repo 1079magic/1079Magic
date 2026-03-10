@@ -1118,6 +1118,15 @@
 
       <div class="pill" style="margin-top:18px; margin-bottom:10px; font-size:20px;">Join rallies</div>
       <div id="joinTableWrap" style="margin-top:10px"></div>
+      <div class="sub-panel" style="background:#131821; border-color:#2d3340;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
+          <div>
+            <div style="font-weight:600">Recommended marches</div>
+            <div id="recommendedDisplay" class="muted" style="margin-top:4px;">…</div>
+          </div>
+          <button id="btnUseRecommended" class="inline-btn btn-magic" style="white-space:nowrap;">🔥Recommended</button>
+        </div>
+      </div>
     </section>
       <div class="btn-row" style="justify-content:space-between; align-items:center;">
         <div style="margin-top:10px;">
@@ -1136,16 +1145,6 @@
       <div class="muted" style="margin-top:8px;">
         Top‑10 best-scoring call/join set‑ups (simulated with your damage engine).
       </div>
-
-          <div class="sub-panel" style="background:#131821; border-color:#2d3340;">
-      <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap;">
-        <div>
-          <div style="font-weight:600">Recommended marches</div>
-          <div id="recommendedDisplay" class="muted" style="margin-top:4px;">…</div>
-        </div>
-        <button id="btnUseRecommended" class="inline-btn btn-magic" style="white-space:nowrap;">🔥Recommended</button>
-      </div>
-    </div>
 
     <section class="sub-panel">
       <h3 style="margin-top:0;">Scoreboard</h3>
@@ -1192,6 +1191,15 @@
           </label>
           <input id="compInputJoin" type="text" placeholder="e.g. 5/20/75">
           <div id="compHintJoin" class="muted" style="margin-top:4px; font-size:0.78rem;"></div>
+              <div class="sub-panel" style="margin-top:14px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <div style="font-weight:600">Recommended marches</div>
+                <div id="opt_recommendedDisplay" class="muted" style="margin-top:4px;">…</div>
+              </div>
+              <button id="opt_btnUseRecommended" class="inline-btn btn-optiona" style="white-space:nowrap;">🔥Recommended</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -1211,21 +1219,10 @@
       </div>
     </div>
 
-  <section class="sub-panel">
-      <div id="ternaryPlot" style="width:100%; height:650px;"></div>
-      <div id="bestReadout2" class="muted" style="margin-top:10px"></div>
-  </section> 
-
-        
-    <div class="sub-panel" style="margin-top:14px;">
-      <div style="display:flex; justify-content:space-between; align-items:center;">
-        <div>
-          <div style="font-weight:600">Recommended marches</div>
-          <div id="opt_recommendedDisplay" class="muted" style="margin-top:4px;">…</div>
-        </div>
-        <button id="opt_btnUseRecommended" class="inline-btn btn-optiona" style="white-space:nowrap;">🔥Recommended</button>
-      </div>
-    </div>
+      <section class="sub-panel">
+          <div id="ternaryPlot" style="width:100%; height:650px;"></div>
+          <div id="bestReadout2" class="muted" style="margin-top:10px"></div>
+      </section> 
       </div>
     </div>
   </section>
