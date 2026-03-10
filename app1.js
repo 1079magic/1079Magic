@@ -448,6 +448,10 @@
 
   // ── NEW: update the recommended display text and button state ──
   function updateRecommendedDisplay(recN, X) {
+    // While in recommended mode (_originalMarches is set), freeze everything —
+    // don't overwrite __recommendedMarches or the display text.
+    if (_originalMarches !== null) return;
+
     if (recN > 0) {
       window.__recommendedMarches = recN;
       $("recommendedDisplay").textContent =
@@ -971,14 +975,15 @@ Stock used: ${used} / ${before}.`;
       compute(mode);
     });
 
-    // ── "Use Recommended" button — single click, applies and re-computes ──
+    // ── "Use Recommended" button — single click applies, second click restores ──
     $("btnUseRecommended")?.addEventListener("click", () => {
       const btn = $("btnUseRecommended");
-      const recN = window.__recommendedMarches;
-      if (!recN) return;
 
       if (_originalMarches === null) {
-        // First click: save original, apply recommended, update button to show ✏️ Manual
+        // First click: capture recN NOW before any compute can overwrite it,
+        // save original march count, apply recommended, flip to ✏️ Manual
+        const recN = window.__recommendedMarches;
+        if (!recN) return;
         _originalMarches = $("numFormations").value;
         $("numFormations").value = recN;
         if (btn) {
