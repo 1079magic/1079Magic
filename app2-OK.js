@@ -752,7 +752,7 @@ function buildRally(fractions, rallySize, stock) {
           if (window.__recommendedMarches) {
             window.__optARecommendedMode = true;
             window.__optAUserMarchCount = document.getElementById("numFormations").value;
-            btnUseRecommended.textContent = "✏️ Manual";
+            btnUseRecommended.textContent = "↩ Reset to Original";
             btnUseRecommended.style.background = "#157347";
             // Run with recommended march count but keep user's input field unchanged
             const savedVal = document.getElementById("numFormations").value;
