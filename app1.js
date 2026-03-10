@@ -10,7 +10,7 @@
 (function(){
   'use strict';
 
-  // ------------------- Constants -------------------
+  // ------------------- Constants (unchanged) -------------------
   const WINDOWS = 5;
   const BEAR_TROOPS = 5000;
   const BEAR_DEF = 10;
@@ -26,19 +26,20 @@
   const INF_MAX_PCT = 0.10;
   const CAV_MIN_PCT = 0.10;
 
-  const FILL_THRESHOLD = 0.923;   // kept for legacy use
+  const FILL_THRESHOLD = 0.923;
   const MIN_INF_PCT_MARCH = 0.05;
 
   // ── NEW: Recommendation gates ──
-  const REC_FILL_GATE     = 0.85;   // Step 1: march must be ≥ 85% full
-  const REC_ARC_MIN_PCT   = 0.10;   // Step 2: archer share must be ≥ 10%
-  const REC_MAX_SINGLE    = 0.80;   // Step 2: no single troop type > 80%
-  // "mostly infantry, no archers" = arc===0 AND inf > cav (checked inline)
-  // "missing cavalry entirely"    = cav===0 (checked inline)
+  const REC_FILL_GATE   = 0.85;   // march must be ≥ 85% full
+  const REC_ARC_MIN_PCT = 0.10;   // archer share must be ≥ 10%
+  const REC_MAX_SINGLE  = 0.80;   // no single troop type > 80%
 
   let TIERS = null;
   let inited = false;
   let armed = false;
+
+  // ── NEW: toggle state for "Use Recommended" button ──
+  let _originalMarches = null;  // null = user value active; string = saved while recommended shown
 
   // ------------------- Utilities -------------------
   function $(id){ return document.getElementById(id); }
@@ -152,66 +153,137 @@
   function allocateArchersToJoins(stock, X, joinCap, minInfPct, minCavPct) {
     const s = cloneStock(stock);
     const joins = [];
+    
     for (let i = 0; i < X; i++) {
-      if (joinCap <= 0) { joins.push({ inf: 0, cav: 0, arc: 0 }); continue; }
+      if (joinCap <= 0) {
+        joins.push({ inf: 0, cav: 0, arc: 0 });
+        continue;
+      }
+
       const minInf = Math.ceil(joinCap * minInfPct);
       const minCav = Math.ceil(joinCap * minCavPct);
-      const p = { inf: Math.min(s.inf, minInf), cav: Math.min(s.cav, minCav), arc: 0 };
-      s.inf -= p.inf; s.cav -= p.cav;
+      
+      const p = {
+        inf: Math.min(s.inf, minInf),
+        cav: Math.min(s.cav, minCav),
+        arc: 0
+      };
+      
+      s.inf -= p.inf;
+      s.cav -= p.cav;
+      
       const remaining = joinCap - (p.inf + p.cav);
       p.arc = Math.min(s.arc, Math.max(0, remaining));
       s.arc -= p.arc;
+      
       joins.push(p);
     }
+    
     return { joins, leftover: s };
   }
+
   function allocateArchersToCall(stock, rallySize, infMin, infMax, cavMin) {
     const s = cloneStock(stock);
-    if (rallySize <= 0) return { rally: { inf: 0, cav: 0, arc: 0 }, leftover: s };
+    
+    if (rallySize <= 0) {
+      return { rally: { inf: 0, cav: 0, arc: 0 }, leftover: s };
+    }
+
     const minInf = Math.ceil(rallySize * infMin);
     const minCav = Math.ceil(rallySize * cavMin);
-    let inf = Math.min(s.inf, minInf); s.inf -= inf;
-    let cav = Math.min(s.cav, minCav); s.cav -= cav;
+
+    let inf = Math.min(s.inf, minInf);
+    s.inf -= inf;
+
+    let cav = Math.min(s.cav, minCav);
+    s.cav -= cav;
+
     let used = inf + cav;
     let space = rallySize - used;
-    let arc = Math.min(s.arc, space); s.arc -= arc; used += arc; space = rallySize - used;
-    if (space > 0) { const extraCav = Math.min(s.cav, space); cav += extraCav; s.cav -= extraCav; used += extraCav; space = rallySize - used; }
-    if (space > 0) { const extraInf = Math.min(s.inf, space); inf += extraInf; s.inf -= extraInf; }
-    return { rally: { inf, cav, arc }, leftover: s };
+    let arc = Math.min(s.arc, space);
+    s.arc -= arc;
+    used += arc;
+    space = rallySize - used;
+
+    if (space > 0) {
+      const extraCav = Math.min(s.cav, space);
+      cav += extraCav;
+      s.cav -= extraCav;
+      used += extraCav;
+      space = rallySize - used;
+    }
+
+    if (space > 0) {
+      const extraInf = Math.min(s.inf, space);
+      inf += extraInf;
+      s.inf -= extraInf;
+    }
+
+    return {
+      rally: { inf, cav, arc },
+      leftover: s
+    };
   }
+
   function planArcherPriorityAlloc(stock0, rallySize, X, joinCap, infMin, infMax, cavMin) {
     const s = cloneStock(stock0);
+
     const phase1 = allocateArchersToJoins(s, X, joinCap, infMin, cavMin);
     const joins = phase1.joins;
     const remaining = phase1.leftover;
+
     const phase2 = allocateArchersToCall(remaining, rallySize, infMin, infMax, cavMin);
     const rally = phase2.rally;
     const finalLeftover = phase2.leftover;
+
     const totalUsed = sumTroops(rally) + joins.reduce((sum, p) => sum + sumTroops(p), 0);
     const TT = Math.max(1, totalUsed);
+    
     const allTroops = { inf: 0, cav: 0, arc: 0 };
     allTroops.inf = rally.inf + joins.reduce((sum, p) => sum + p.inf, 0);
     allTroops.cav = rally.cav + joins.reduce((sum, p) => sum + p.cav, 0);
     allTroops.arc = rally.arc + joins.reduce((sum, p) => sum + p.arc, 0);
-    const fractions = { i: allTroops.inf / TT, c: allTroops.cav / TT, a: allTroops.arc / TT };
+
+    const fractions = {
+      i: allTroops.inf / TT,
+      c: allTroops.cav / TT,
+      a: allTroops.arc / TT
+    };
+
     return {
-      rally, packs: joins, leftover: finalLeftover, fractions,
-      stats: { usedInf: allTroops.inf, usedCav: allTroops.cav, usedArc: allTroops.arc, arcReduction: stock0.arc - finalLeftover.arc }
+      rally,
+      packs: joins,
+      leftover: finalLeftover,
+      fractions,
+      stats: {
+        usedInf: allTroops.inf,
+        usedCav: allTroops.cav,
+        usedArc: allTroops.arc,
+        arcReduction: stock0.arc - finalLeftover.arc
+      }
     };
   }
+
   function improveArcherUtilization(rally, joins, leftover, joinCap, maxInfPct) {
     const lo = cloneStock(leftover);
+    
     for (let i = 0; i < joins.length; i++) {
       const march = joins[i];
       const marchTotal = march.inf + march.cav + march.arc;
+      
       if (marchTotal >= joinCap) continue;
+      
       const space = joinCap - marchTotal;
       const canRemoveInf = march.inf - Math.ceil(joinCap * maxInfPct);
+      
       if (canRemoveInf > 0 && lo.arc > 0) {
         const transfer = Math.min(canRemoveInf, lo.arc, space);
-        march.inf -= transfer; march.arc += transfer; lo.arc -= transfer;
+        march.inf -= transfer;
+        march.arc += transfer;
+        lo.arc -= transfer;
       }
     }
+
     return lo;
   }
   // ================ END ARCHER PRIORITY LOGIC ================
@@ -241,9 +313,15 @@
     const C = Math.max(0, cap|0);
     const Xn = Math.max(0, X|0);
     const T = R + Xn * C;
+
     const { wInf, wCav, wArc } = magicWeightsSquared(tierKey, mode);
     const sumW = Math.max(1e-9, wInf + wCav + wArc);
-    const base = { inf: T * (wInf / sumW), cav: T * (wCav / sumW), arc: T * (wArc / sumW) };
+    const base = {
+      inf: T * (wInf / sumW),
+      cav: T * (wCav / sumW),
+      arc: T * (wArc / sumW)
+    };
+
     let target = {
       inf: Math.min(s.inf, Math.round(base.inf)),
       cav: Math.min(s.cav, Math.round(base.cav)),
@@ -251,6 +329,7 @@
     };
     let used = target.inf + target.cav + target.arc;
     let deficit = T - used;
+
     const prio = [['arc', wArc], ['cav', wCav], ['inf', wInf]].sort((a,b)=>b[1]-a[1]);
     while (deficit > 0) {
       let progressed = false;
@@ -258,20 +337,33 @@
         const free = s[k] - target[k];
         if (free <= 0) continue;
         const give = Math.min(free, deficit);
-        target[k] += give; deficit -= give; progressed = true;
+        target[k] += give;
+        deficit -= give;
+        progressed = true;
         if (deficit <= 0) break;
       }
       if (!progressed) break;
     }
+
     const TT = Math.max(1, target.inf + target.cav + target.arc);
     const frac = { i: target.inf/TT, c: target.cav/TT, a: target.arc/TT };
-    const rally = { inf: Math.min(s.inf, Math.round(frac.i * R)), cav: Math.min(s.cav, Math.round(frac.c * R)), arc: 0 };
+
+    const rally = {
+      inf: Math.min(s.inf, Math.round(frac.i * R)),
+      cav: Math.min(s.cav, Math.round(frac.c * R)),
+      arc: 0
+    };
     rally.arc = Math.min(s.arc, R - (rally.inf + rally.cav));
     s.inf -= rally.inf; s.cav -= rally.cav; s.arc -= rally.arc;
+
     const joins = [];
     for (let i = 0; i < Xn; i++) {
       if (C <= 0) { joins.push({inf:0,cav:0,arc:0}); continue; }
-      const m = { inf: Math.min(s.inf, Math.round(frac.i * C)), cav: Math.min(s.cav, Math.round(frac.c * C)), arc: 0 };
+      const m = {
+        inf: Math.min(s.inf, Math.round(frac.i * C)),
+        cav: Math.min(s.cav, Math.round(frac.c * C)),
+        arc: 0
+      };
       m.arc = Math.min(s.arc, C - (m.inf + m.cav));
       s.inf -= m.inf; s.cav -= m.cav; s.arc -= m.arc;
       joins.push(m);
@@ -281,59 +373,40 @@
 
   // ================================================================
   // NEW RECOMMENDATION ENGINE
-  // Uses the actual fractions computed for this run to simulate joins.
-  // Gate 1: march headcount ≥ 85% of cap (REC_FILL_GATE)
-  // Gate 2: troop quality checks:
+  // Uses the actual fractions from this run to simulate joins.
+  // Gate 1: march headcount >= 85% of cap
+  // Gate 2: troop quality:
   //   a) mostly infantry with no archers (arc===0 AND inf > cav)
   //   b) missing cavalry entirely (cav===0)
   //   c) archer share < 10%
   //   d) any single troop type > 80%
-  // Returns: highest N (1..maxN) where ALL N marches pass BOTH gates.
-  // If no N passes, returns 0 with a descriptive reason.
+  // Returns: highest N (1..maxN) where ALL N marches pass both gates.
   // ================================================================
   function evaluateMarchQuality(p, cap) {
     const total = (p.inf|0) + (p.cav|0) + (p.arc|0);
     const failures = [];
-
-    // Gate 1: fill
     const fill = cap > 0 ? total / cap : 0;
-    if (fill < REC_FILL_GATE) {
-      failures.push(`fill ${(fill*100).toFixed(0)}%<85%`);
-    }
-
+    if (fill < REC_FILL_GATE) failures.push(`fill ${(fill*100).toFixed(0)}%<85%`);
     if (total > 0) {
-      // Gate 2a: mostly infantry, no archers
-      if (p.arc === 0 && p.inf > p.cav) {
-        failures.push('inf-only');
-      }
-      // Gate 2b: missing cavalry
-      if (p.cav === 0) {
-        failures.push('no-cav');
-      }
-      // Gate 2c: archer share < 10%
+      if (p.arc === 0 && p.inf > p.cav) failures.push('inf-only');
+      if (p.cav === 0) failures.push('no-cav');
       const arcPct = p.arc / total;
-      if (arcPct < REC_ARC_MIN_PCT) {
-        failures.push(`arc ${(arcPct*100).toFixed(0)}%<10%`);
-      }
-      // Gate 2d: any single type > 80%
+      if (arcPct < REC_ARC_MIN_PCT) failures.push(`arc ${(arcPct*100).toFixed(0)}%<10%`);
       const infPct = p.inf / total;
       const cavPct = p.cav / total;
       if (infPct > REC_MAX_SINGLE) failures.push(`inf ${(infPct*100).toFixed(0)}%>80%`);
       if (cavPct > REC_MAX_SINGLE) failures.push(`cav ${(cavPct*100).toFixed(0)}%>80%`);
       if (arcPct > REC_MAX_SINGLE) failures.push(`arc ${(arcPct*100).toFixed(0)}%>80%`);
     }
-
     return { pass: failures.length === 0, failures };
   }
 
-  // Simulate N join marches using the same proportional fractions as the actual run.
-  // stockAfterCall = remaining stock after the call rally was built.
+  // Simulate N join marches proportionally from fractions (same as actual run)
   function simulateJoinsForRec(stockAfterCall, n, cap, fractions) {
     const s = cloneStock(stockAfterCall);
     const fi = fractions.i ?? 0;
     const fc = fractions.c ?? 0;
-    const fa = fractions.a ?? 0;
-    const W = Math.max(1e-9, fi + fc + fa);
+    const W = Math.max(1e-9, fi + fc + (fractions.a ?? 0));
     const packs = [];
     for (let i = 0; i < n; i++) {
       if (cap <= 0) { packs.push({ inf:0, cav:0, arc:0 }); continue; }
@@ -352,38 +425,78 @@
     return packs;
   }
 
-  // Main recommendation function.
-  // rally       = the actual built call rally
-  // stockAfterCall = stock remaining after call rally was deducted
-  // fractions   = { i, c, a } fractions used for the actual run
-  // maxN        = user's # of marches input
-  // cap         = join cap
   function recommendMarchCount(rally, stockAfterCall, fractions, maxN, cap) {
     let bestN = 0;
     const details = [];
-
     for (let n = 1; n <= Math.max(1, maxN|0); n++) {
       const packs = simulateJoinsForRec(stockAfterCall, n, cap, fractions);
       let allPass = true;
       const packResults = [];
-
       for (let i = 0; i < packs.length; i++) {
         const { pass, failures } = evaluateMarchQuality(packs[i], cap);
         packResults.push({ march: i + 1, pass, failures });
         if (!pass) allPass = false;
       }
-
       details.push({ n, allPass, packs: packResults });
       if (allPass) bestN = n;
-      // Keep going — we want the HIGHEST N where all pass
     }
-
     return { bestN, details };
   }
-
   // ================================================================
   // END NEW RECOMMENDATION ENGINE
   // ================================================================
+
+  // ── NEW: update the recommended display text and button state ──
+  function updateRecommendedDisplay(recN, X) {
+    const btn = $("btnUseRecommended");
+    if (recN > 0) {
+      window.__recommendedMarches = recN;
+      $("recommendedDisplay").textContent =
+        `Best: ${recN} march${recN > 1 ? 'es' : ''} — all pass ≥85% fill + troop quality gates`;
+      if (btn) { btn.disabled = false; btn.title = `Apply ${recN} march${recN>1?'es':''}` };
+    } else {
+      window.__recommendedMarches = X;
+      $("recommendedDisplay").textContent = `No marches pass quality gates — showing ${X} as entered`;
+      if (btn) { btn.disabled = true; btn.title = ''; }
+    }
+    // Reset button to default state whenever compute runs
+    _originalMarches = null;
+    if (btn) {
+      btn.textContent = "🔥 Recommended";
+      btn.style.background = "";
+    }
+  }
+
+  // ------------------- Recommendation support (OLD — kept for reference, no longer called) -------------------
+  function meetsTargetFill(fill){ return fill >= FILL_THRESHOLD; }
+  function evaluateMarchSet(packs, cap){
+    const totals = packs.map(p => (p.inf + p.cav + p.arc));
+    const fills = totals.map(t => cap > 0 ? (t / cap) : 0);
+    const minFill = fills.length ? Math.min(...fills) : 0;
+    const avgFill = fills.length ? (fills.reduce((a,b)=>a+b,0) / fills.length) : 0;
+    const fullCount = fills.filter(f => meetsTargetFill(f)).length;
+    return { minFill, avgFill, fullCount };
+  }
+  function buildJoinRallies(mode, stockIn, X, cap, tierKey, manualTriplet=null){
+    const s = cloneStock(stockIn);
+    const w = manualTriplet ? {inf:manualTriplet.i, cav:manualTriplet.c, arc:manualTriplet.a} : {inf:1, cav:1, arc:1};
+    const W = Math.max(1e-9, w.inf + w.cav + w.arc);
+    const packs = [];
+    for (let i=0; i<X; i++){
+      const tInf = Math.round((w.inf / W) * cap);
+      const tCav = Math.round((w.cav / W) * cap);
+      const p = {
+        inf: Math.min(s.inf, tInf),
+        cav: Math.min(s.cav, tCav),
+        arc: 0
+      };
+      const rem = cap - (p.inf + p.cav);
+      p.arc = Math.min(s.arc, rem);
+      s.inf -= p.inf; s.cav -= p.cav; s.arc -= p.arc;
+      packs.push(p);
+    }
+    return { packs, leftover: s };
+  }
 
   // ------------------- Rendering -------------------
   function renderCallTable(r){
@@ -426,21 +539,59 @@
     out += `</tbody></table>`;
     $("joinTableWrap").innerHTML = out;
   }
+  function renderScoreboardCompact(rally, joins, tierKey){
+    const callScore = computeFormationDamage(rally, tierKey).finalScore;
+    let joinScore = 0; for(const p of joins){ joinScore += computeFormationDamage(p, tierKey).finalScore; }
+    let out = `
+      <table>
+        <thead>
+          <tr><th>Window</th><th>Call</th><th>Joins</th><th>Total</th></tr>
+        </thead>
+        <tbody>
+    `;
+    for(let w=1; w<=WINDOWS; w++){
+      out += `
+        <tr>
+          <td>${w}</td>
+          <td>${callScore}</td>
+          <td>${joinScore}</td>
+          <td>${callScore + joinScore}</td>
+        </tr>
+      `;
+    }
+    out += `</tbody></table>`;
+    $("scoreboardTableWrap").innerHTML = out;
+  }
 
   function renderFinalScoreboard(rally, joins, tierKey) {
     const callDmg  = computeFormationDamage(rally, tierKey);
     const callScore = callDmg.finalScore;
+
     let joinScore = 0;
-    for (const p of joins) { joinScore += computeFormationDamage(p, tierKey).finalScore; }
+    for (const p of joins) {
+      joinScore += computeFormationDamage(p, tierKey).finalScore;
+    }
     const totalScore = callScore + joinScore;
+
     const callTotal = Math.max(1, sumTroops(rally));
-    const callFrac = { i: rally.inf / callTotal, c: rally.cav / callTotal, a: rally.arc / callTotal };
+    const callFrac = {
+      i: rally.inf / callTotal,
+      c: rally.cav / callTotal,
+      a: rally.arc / callTotal
+    };
+
     let jInf = 0, jCav = 0, jArc = 0;
     for (const p of joins) { jInf += p.inf; jCav += p.cav; jArc += p.arc; }
     const joinTotal = Math.max(1, jInf + jCav + jArc);
-    const joinFrac = { i: jInf / joinTotal, c: jCav / joinTotal, a: jArc / joinTotal };
+    const joinFrac = {
+      i: jInf / joinTotal,
+      c: jCav / joinTotal,
+      a: jArc / joinTotal
+    };
+
     const callTrip = toPctTriplet(callFrac);
     const joinTrip = toPctTriplet(joinFrac);
+
     let html = `
       <table>
         <thead>
@@ -466,6 +617,7 @@
       </tr>
     `;
     html += `</tbody></table>`;
+
     $("scoreboardTableWrap").innerHTML = html;
   }
 
@@ -473,7 +625,10 @@
   function ensureMinInf(march, minInf, stockLeftover){
     if (march.inf >= minInf) return;
     let need = minInf - march.inf;
-    if (stockLeftover.inf > 0) { const take = Math.min(stockLeftover.inf, need); march.inf += take; stockLeftover.inf -= take; need -= take; }
+    if (stockLeftover.inf > 0) {
+      const take = Math.min(stockLeftover.inf, need);
+      march.inf += take; stockLeftover.inf -= take; need -= take;
+    }
     if (need > 0) { const fromCav = Math.min(march.cav, need); march.cav -= fromCav; march.inf += fromCav; need -= fromCav; }
     if (need > 0) { const fromArc = Math.min(march.arc, need); march.arc -= fromArc; march.inf += fromArc; need -= fromArc; }
   }
@@ -481,25 +636,35 @@
     const minInf = Math.ceil(rallySize * MIN_INF_PCT_MARCH);
     const maxInf = Math.floor(rallySize * (opts.maxInfPct ?? 0.20));
     const maxCav = Math.floor(rallySize * (opts.maxCavPct ?? 0.30));
+
     if (rally.inf < minInf) {
       let need = minInf - rally.inf;
-      if (leftover.inf > 0) { const take = Math.min(leftover.inf, need); rally.inf += take; leftover.inf -= take; need -= take; }
+      if (leftover.inf > 0) {
+        const take = Math.min(leftover.inf, need);
+        rally.inf += take; leftover.inf -= take; need -= take;
+      }
       if (need > 0) { const fromCav = Math.min(rally.cav, need); rally.cav -= fromCav; rally.inf += fromCav; need -= fromCav; }
       if (need > 0) { const fromArc = Math.min(rally.arc, need); rally.arc -= fromArc; rally.inf += fromArc; need -= fromArc; }
     }
+
     function swapIntoArc(fromKey, amount) {
       if (amount <= 0 || leftover.arc <= 0) return 0;
       const give = Math.min(amount, leftover.arc);
-      rally[fromKey] -= give; rally.arc += give; leftover.arc -= give; leftover[fromKey] += give;
+      rally[fromKey] -= give;
+      rally.arc += give;
+      leftover.arc -= give;
+      leftover[fromKey] += give;
       return give;
     }
+
     if (rally.inf > maxInf) {
       let cut = rally.inf - maxInf;
       const arcTaken = swapIntoArc("inf", cut); cut -= arcTaken;
       if (cut > 0 && rally.cav < maxCav && leftover.cav > 0) {
         const cavRoom = maxCav - rally.cav;
         const give = Math.min(cut, cavRoom, leftover.cav);
-        rally.inf -= give; rally.cav += give; leftover.cav -= give; leftover.inf += give; cut -= give;
+        rally.inf -= give; rally.cav += give;
+        leftover.cav -= give; leftover.inf += give; cut -= give;
       }
     }
     if (rally.cav > maxCav) {
@@ -511,6 +676,7 @@
         rally.cav -= give; rally.inf += give; leftover.cav += give; cut -= give;
       }
     }
+
     const biasPct = opts.arcBiasPct ?? 0.03;
     let want = Math.max(0, Math.ceil(rallySize * biasPct));
     if (want > 0 && leftover.arc > 0) {
@@ -524,6 +690,7 @@
         rally.cav -= takeFromCav; rally.arc += takeFromCav; leftover.arc -= takeFromCav; leftover.cav += takeFromCav; want -= takeFromCav;
       }
     }
+
     if (rally.inf < minInf) {
       const need = minInf - rally.inf;
       const fromArc = Math.min(rally.arc, need); rally.arc -= fromArc; rally.inf += fromArc;
@@ -535,7 +702,9 @@
     const marches = [rally, ...joins];
     const mins = [Math.ceil(rallySize * MIN_INF_PCT_MARCH)];
     for (let i=0; i<joins.length; i++){ mins.push(Math.ceil(joinCap * MIN_INF_PCT_MARCH)); }
+
     for (let i=0; i<marches.length; i++){ ensureMinInf(marches[i], mins[i], leftover); }
+
     const types = ["arc", "cav"];
     for (const t of types){
       if (leftover[t] <= 0) continue;
@@ -558,6 +727,7 @@
       }
     }
   }
+
   function deriveJoinFractions(joins){
     let I=0,C=0,A=0;
     for (const p of joins){ I+=p.inf; C+=p.cav; A+=p.arc; }
@@ -619,27 +789,15 @@
     const t = rallySize;
     let idealInf = Math.round((w.inf / W) * t);
     let idealCav = Math.round((w.cav / W) * t);
-    const r = { inf: Math.min(s.inf, idealInf), cav: Math.min(s.cav, idealCav), arc: 0 };
+    const r = {
+      inf: Math.min(s.inf, idealInf),
+      cav: Math.min(s.cav, idealCav),
+      arc: 0
+    };
     const remaining = t - (r.inf + r.cav);
     r.arc = Math.min(s.arc, remaining);
     s.inf -= r.inf; s.cav -= r.cav; s.arc -= r.arc;
     return { rally:r, stockAfter:s };
-  }
-  function buildJoinRallies(mode, stockIn, X, cap, tierKey, manualTriplet=null){
-    const s = cloneStock(stockIn);
-    const w = manualTriplet ? {inf:manualTriplet.i, cav:manualTriplet.c, arc:manualTriplet.a} : {inf:1, cav:1, arc:1};
-    const W = Math.max(1e-9, w.inf + w.cav + w.arc);
-    const packs = [];
-    for (let i=0; i<X; i++){
-      const tInf = Math.round((w.inf / W) * cap);
-      const tCav = Math.round((w.cav / W) * cap);
-      const p = { inf: Math.min(s.inf, tInf), cav: Math.min(s.cav, tCav), arc: 0 };
-      const rem = cap - (p.inf + p.cav);
-      p.arc = Math.min(s.arc, rem);
-      s.inf -= p.inf; s.cav -= p.cav; s.arc -= p.arc;
-      packs.push(p);
-    }
-    return { packs, leftover: s };
   }
 
   // ------------------- Compute flow -------------------
@@ -673,21 +831,29 @@
           maxInfPct: 0.20, maxCavPct: 0.30, arcBiasPct: 0.03
         });
         applyPriorityPostFix(rallyBest, joinsBest, leftoverBest, rallySize, joinCap);
-        // If archer-priority alloc leaves fewer archers in leftover, prefer it
-        const archerOptimized = planArcherPriorityAlloc(stock0, rallySize, X, joinCap, INF_MIN_PCT, INF_MAX_PCT, CAV_MIN_PCT);
+
+        // Apply archer priority optimization AFTER existing logic
+        const archerOptimized = planArcherPriorityAlloc(
+          stock0, rallySize, X, joinCap, INF_MIN_PCT, INF_MAX_PCT, CAV_MIN_PCT
+        );
         if (archerOptimized.leftover.arc < leftoverBest.arc) {
           rallyBest = archerOptimized.rally;
           joinsBest = archerOptimized.packs;
           leftoverBest = archerOptimized.leftover;
         }
         renderFinalScoreboard(rallyBest, joinsBest, tierKey);
+
       } else {
         const plan = planMagicAlloc("magic12", stock0, rallySize, X, joinCap, tierKey);
         rallyBest = plan.rally; joinsBest = plan.packs; leftoverBest = plan.leftover;
-        adjustCallRallyCapsAndBias(rallyBest, leftoverBest, rallySize, { maxInfPct: 0.20, maxCavPct: 0.30, arcBiasPct: 0.03 });
+        adjustCallRallyCapsAndBias(rallyBest, leftoverBest, rallySize, {
+          maxInfPct: 0.20, maxCavPct: 0.30, arcBiasPct: 0.03
+        });
         applyPriorityPostFix(rallyBest, joinsBest, leftoverBest, rallySize, joinCap);
-        // If archer-priority alloc leaves fewer archers in leftover, prefer it
-        const archerOptimized = planArcherPriorityAlloc(stock0, rallySize, X, joinCap, INF_MIN_PCT, INF_MAX_PCT, CAV_MIN_PCT);
+
+        const archerOptimized = planArcherPriorityAlloc(
+          stock0, rallySize, X, joinCap, INF_MIN_PCT, INF_MAX_PCT, CAV_MIN_PCT
+        );
         if (archerOptimized.leftover.arc < leftoverBest.arc) {
           rallyBest = archerOptimized.rally;
           joinsBest = archerOptimized.packs;
@@ -702,57 +868,51 @@
     } else {
       // ratio11 mode
       let stats = {
-        inf_atk:nval("inf_atk"), inf_let:nval("inf_let"),
-        cav_atk:nval("cav_atk"), cav_let:nval("cav_let"),
-        arc_atk:nval("arc_atk"), arc_let:nval("arc_let")
+        inf_atk:nval("inf_atk"),
+        inf_let:nval("inf_let"),
+        cav_atk:nval("cav_atk"),
+        cav_let:nval("cav_let"),
+        arc_atk:nval("arc_atk"),
+        arc_let:nval("arc_let")
       };
       for (const k of ["inf_atk","inf_let","cav_atk","cav_let","arc_atk","arc_let"]) {
         if (!Number.isFinite(stats[k]) || stats[k] <= 0) stats[k] = 1;
       }
       let opt = computeExactOptimalFractions(stats, tierKey);
       opt = enforceBounds(opt);
-      if (!isFinite(opt.fi) || !isFinite(opt.fc) || !isFinite(opt.fa)) opt = { fi:0.08, fc:0.12, fa:0.80 };
+      if (!isFinite(opt.fi) || !isFinite(opt.fc) || !isFinite(opt.fa)) {
+        opt = { fi:0.08, fc:0.12, fa:0.80 };
+      }
       const frac = { i: opt.fi, c: opt.fc, a: opt.fa };
       const useFrac = manual ? manual : frac;
+
       const cr = buildCallRally("ratio11", stock0, rallySize, tierKey, useFrac);
       const jr = buildJoinRallies("ratio11", cr.stockAfter, X, joinCap, tierKey, useFrac);
       rally = cr.rally; joins = jr.packs; leftover = jr.leftover;
-      // If archer-priority alloc leaves fewer archers in leftover, prefer it
-      const archerOptimized = planArcherPriorityAlloc(stock0, rallySize, X, joinCap, INF_MIN_PCT, INF_MAX_PCT, CAV_MIN_PCT);
+
+      const archerOptimized = planArcherPriorityAlloc(
+        stock0, rallySize, X, joinCap, INF_MIN_PCT, INF_MAX_PCT, CAV_MIN_PCT
+      );
       if (archerOptimized.leftover.arc < leftover.arc) {
         rally = archerOptimized.rally;
         joins = archerOptimized.packs;
         leftover = archerOptimized.leftover;
         fractions = archerOptimized.fractions;
       } else {
-        const tCall2 = Math.max(1, sumTroops(rally));
-        fractions = { i:rally.inf/tCall2, c:rally.cav/tCall2, a:rally.arc/tCall2 };
+        const tCall = Math.max(1, sumTroops(rally));
+        fractions = { i:rally.inf/tCall, c:rally.cav/tCall, a:rally.arc/tCall };
       }
       renderFinalScoreboard(rally, joins, tierKey);
     }
 
-    // ── NEW RECOMMENDATION: use actual rally + fractions ──
-    // Stock after call = stock0 minus what the call rally consumed
+    // ── NEW RECOMMENDATION ENGINE ──
     const stockAfterCall = {
       inf: Math.max(0, (stock0.inf|0) - (rally.inf|0)),
       cav: Math.max(0, (stock0.cav|0) - (rally.cav|0)),
       arc: Math.max(0, (stock0.arc|0) - (rally.arc|0))
     };
     const recResult = recommendMarchCount(rally, stockAfterCall, fractions, X, joinCap);
-    const recN = recResult.bestN;
-
-    window.__recommendedMarches = recN > 0 ? recN : X;
-
-    if (recN > 0) {
-      $("recommendedDisplay").textContent =
-        `Best: ${recN} march${recN > 1 ? 'es' : ''} — all pass ≥85% fill + troop quality gates`;
-    } else {
-      // No N passed — show why first march failed as a hint
-      const firstDetail = recResult.details[0];
-      const failReason = firstDetail?.packs?.[0]?.failures?.join(', ') || 'insufficient troops';
-      $("recommendedDisplay").textContent =
-        `No marches pass quality gates (${failReason}) — showing ${X} as entered`;
-    }
+    updateRecommendedDisplay(recResult.bestN, X);
 
     // Display
     renderCallTable(rally);
@@ -805,47 +965,33 @@ Stock used: ${used} / ${before}.`;
       const mode = $("hiddenLastMode")?.value || "magic12";
       compute(mode);
     });
-    // ── Recommended / Reset toggle ──
-    // State: null = showing original, number = currently showing recommended
-    let _originalMarches = null;
 
-    function updateRecButton() {
-      const btn = $("btnUseRecommended");
-      if (!btn) return;
-      if (_originalMarches !== null) {
-        btn.textContent = "↩ Reset to Original";
-        btn.style.background = "#6b7280";
-      } else {
-        btn.textContent = "✅ Use Recommended";
-        btn.style.background = "";
-        btn.className = "btn btn-ok";
-      }
-    }
-
+    // ── "Use Recommended" button — single click, applies and re-computes ──
     $("btnUseRecommended")?.addEventListener("click", () => {
-      const mode = $("hiddenLastMode")?.value || "magic12";
-      if (_originalMarches !== null) {
-        // Currently showing recommended → reset to original
-        $("numFormations").value = _originalMarches;
-        _originalMarches = null;
-        updateRecButton();
+      const btn = $("btnUseRecommended");
+      const recN = window.__recommendedMarches;
+      if (!recN) return;
+
+      if (_originalMarches === null) {
+        // First click: save original, apply recommended, update button to show ✏️ Manual
+        _originalMarches = $("numFormations").value;
+        $("numFormations").value = recN;
+        if (btn) {
+          btn.textContent = "✏️ Manual";
+          btn.style.background = "#157347";
+        }
+        const mode = $("hiddenLastMode")?.value || "magic12";
         Promise.resolve().then(() => compute(mode));
       } else {
-        // Currently showing original → apply recommended
-        if (window.__recommendedMarches) {
-          _originalMarches = $("numFormations").value;
-          $("numFormations").value = window.__recommendedMarches;
-          updateRecButton();
-          Promise.resolve().then(() => compute(mode));
-        }
-      }
-    });
-
-    // Reset toggle state whenever user manually changes the # of marches field
-    $("numFormations")?.addEventListener("input", () => {
-      if (_originalMarches !== null) {
+        // Second click: restore original value, reset button
+        $("numFormations").value = _originalMarches;
         _originalMarches = null;
-        updateRecButton();
+        if (btn) {
+          btn.textContent = "🔥 Recommended";
+          btn.style.background = "";
+        }
+        const mode = $("hiddenLastMode")?.value || "magic12";
+        Promise.resolve().then(() => compute(mode));
       }
     });
 
