@@ -1,841 +1,798 @@
 /* ============================================================
- #1079 LoL App – Magic Ratio (updated for unified UI)
- Exposes: window.Magic.init()
- - No auto-run
+ #1079 LoL App – Option‑A (updated for unified UI)
+ Exposes: window.OptionA.init(), window.OptionA.computeAll()
+ - Auto-compute on show (plot + optimizer)
  - Reads from shared inputs
- - Renders into Magic panel containers
- WITH ARCHER PRIORITY LOGIC
+ - Namespaced DOM ids to avoid collisions with Magic
 ============================================================ */
 
 (function(){
   'use strict';
 
-  // ------------------- Constants -------------------
-  const WINDOWS = 5;
-  const BEAR_TROOPS = 5000;
-  const BEAR_DEF = 10;
-  const BEAR_HP = 83.3333;
-  const BEAR_DEF_PER_TROOP = (BEAR_HP * BEAR_DEF) / 100;
-  const BEAR_ATK_BONUS = 0.25;
-  const BASE_LETHALITY = 10;
-  const SKILLMOD_INF = 1.0;
-  const SKILLMOD_CAV = 1.0;
-  const SKILLMOD_ARC = 1.10;
-
+  // ---------- Global Composition Bounds ----------
   const INF_MIN_PCT = 0.075;
   const INF_MAX_PCT = 0.10;
   const CAV_MIN_PCT = 0.10;
 
-  const FILL_THRESHOLD = 0.923;   // kept for legacy use
-  const MIN_INF_PCT_MARCH = 0.05;
-
-  // ── NEW: Recommendation gates ──
-  const REC_FILL_GATE     = 0.85;   // Step 1: march must be ≥ 85% full
-  const REC_ARC_MIN_PCT   = 0.10;   // Step 2: archer share must be ≥ 10%
-  const REC_MAX_SINGLE    = 0.80;   // Step 2: no single troop type > 80%
-  // "mostly infantry, no archers" = arc===0 AND inf > cav (checked inline)
-  // "missing cavalry entirely"    = cav===0 (checked inline)
-
-  let TIERS = null;
   let inited = false;
-  let armed = false;
+  let lastBestTriplet = { fin: INF_MIN_PCT, fcav: CAV_MIN_PCT, farc: 1-INF_MIN_PCT-CAV_MIN_PCT };
+  let compUserEdited = false;
+  let compJoinUserEdited = false;
 
-  // ------------------- Utilities -------------------
-  function $(id){ return document.getElementById(id); }
-  function nval(id){
-    const el = $(id);
+  // ---------- Composition Readback State ----------
+  // Stores the last engine-computed fractions for call and join (used as fallback when field is cleared)
+  let _lastEngineCallFractions = null;  // { fin, fcav, farc } — set after buildRally
+  let _lastEngineJoinFractions = null;  // { fin, fcav, farc } — set after buildOptionAFormations (row #1)
+  // Guard: true while readbackCompositionFields is writing to fields, so input listeners don't react
+  let _readbackWriting = false;
+
+  // ---------- Basic Helpers ----------
+  function num(id) {
+    const el = document.getElementById(id);
     if (!el) return 0;
-    const v = (el.value ?? '').trim();
-    if (v === '') return 0;
-    const x = parseFloat(v);
-    return Number.isFinite(x) ? x : 0;
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) ? v : 0;
   }
-  function sumTroops(o){ return (o.inf|0)+(o.cav|0)+(o.arc|0); }
-  function cloneStock(s){
-    return {
-      inf: Math.max(0, s.inf|0),
-      cav: Math.max(0, s.cav|0),
-      arc: Math.max(0, s.arc|0)
-    };
+  function attackFactor(atk, leth) { return (1 + atk/100) * (1 + leth/100); }
+
+  // MAGIC tiers: if T6 → 4.4/1.25; else 2.78/1.45
+  function getArcherCoefByTier(tierRaw) {
+    const t = String(tierRaw||'').toUpperCase();
+    return (t === 'T6') ? (4.4/1.25) : (2.78/1.45);
   }
 
-  // Triplet helpers
-  function parseTriplet(str){
-    if(!str) return null;
-    const arr = str.replace(/%/g,'').trim().split(/[,\s/]+/)
-      .map(Number).filter(Number.isFinite);
-    if(!arr.length) return null;
-    let i = arr[0] ?? 0;
-    let c = arr[1] ?? 0;
-    let a = arr[2] ?? (100 - (i+c));
-    const S = i+c+a;
-    if (S <= 0) return null;
-    return { i:i/S, c:c/S, a:a/S };
-  }
-  function toPctTriplet(fr){
-    const S = (fr.i??0)+(fr.c??0)+(fr.a??0) || 1;
-    const pi = Math.round((fr.i??0)/S*100);
-    const pc = Math.round((fr.c??0)/S*100);
-    const pa = 100 - pi - pc;
-    return `${pi}/${pc}/${pa}`;
-  }
-
-  // ------------------- Damage Engine -------------------
-  function perTroopAttack(baseAtk){
-    return baseAtk * (1 + BEAR_ATK_BONUS) * (BASE_LETHALITY/100);
-  }
-  function computeFormationDamage(pack, tierKey){
-    const t = TIERS?.tiers?.[tierKey];
-    if(!t){
-      return {finalScore:0, byType:{inf:0,cav:0,arc:0}, round10Total:0};
-    }
-    const nInf = pack.inf|0;
-    const nCav = pack.cav|0;
-    const nArc = pack.arc|0;
-    const total = nInf+nCav+nArc;
-    if(total <= 0){
-      return {finalScore:0, byType:{inf:0,cav:0,arc:0}, round10Total:0};
-    }
-    const armyMin = Math.min(total, BEAR_TROOPS);
-    const atkInf = perTroopAttack(t.inf[0]);
-    const atkCav = perTroopAttack(t.cav[0]);
-    const atkArc = perTroopAttack(t.arc[0]);
-    const dInf = Math.sqrt(nInf*armyMin)*(atkInf/BEAR_DEF_PER_TROOP)/100*SKILLMOD_INF;
-    const dCav = Math.sqrt(nCav*armyMin)*(atkCav/BEAR_DEF_PER_TROOP)/100*SKILLMOD_CAV;
-    const dArc = Math.sqrt(nArc*armyMin)*(atkArc/BEAR_DEF_PER_TROOP)/100*SKILLMOD_ARC;
-    const total0 = dInf+dCav+dArc;
-    const total10 = total0*10;
-    return {
-      byType:{inf:dInf,cav:dCav,arc:dArc},
-      round10Total:total10,
-      finalScore:Math.ceil(total10)
-    };
-  }
-
-  // ------------------- 1:1 Ratio Helpers -------------------
-  function attackFactor(atk, let_){ return (1 + atk/100) * (1 + let_/100); }
-  function originalArcherCoef(tierKey){ return (tierKey === 'T6') ? (4.4/1.25) : (2.78/1.45); }
-  function computeExactOptimalFractions(stats, tierKey){
-    let Ainf = attackFactor(stats.inf_atk, stats.inf_let);
-    let Acav = attackFactor(stats.cav_atk, stats.cav_let);
-    let Aarc = attackFactor(stats.arc_atk, stats.arc_let);
-    Ainf = Math.max(Ainf, 1e-6);
-    Acav = Math.max(Acav, 1e-6);
-    Aarc = Math.max(Aarc, 1e-6);
-    const KARC = originalArcherCoef(tierKey);
-    const alpha = Ainf / 1.12;
-    const beta = Acav;
-    const gamma = KARC * Aarc;
-    const a2 = alpha*alpha;
-    const b2 = beta*beta;
-    const g2 = gamma*gamma;
-    const sum = a2 + b2 + g2;
-    if (!isFinite(sum) || sum <= 0) return {fi:0.08, fc:0.12, fa:0.80};
-    return { fi: a2/sum, fc: b2/sum, fa: g2/sum };
-  }
-  function enforceBounds(fr){
-    let i = fr.fi, c = fr.fc, a = fr.fa;
-    if(i < INF_MIN_PCT) i = INF_MIN_PCT;
-    if(i > INF_MAX_PCT) i = INF_MAX_PCT;
-    if(c < CAV_MIN_PCT) c = CAV_MIN_PCT;
+  // ---------- Composition Bounds ----------
+  function enforceCompositionBounds(fin, fcav, farc) {
+    let i = fin, c = fcav, a = farc;
+    if (i < INF_MIN_PCT) i = INF_MIN_PCT;
+    if (i > INF_MAX_PCT) i = INF_MAX_PCT;
+    if (c < CAV_MIN_PCT) c = CAV_MIN_PCT;
     a = 1 - i - c;
-    if(a < 0){
+    if (a < 0) {
       c = Math.max(CAV_MIN_PCT, 1 - i);
       a = 1 - i - c;
-      if(a < 0){ a = 0; c = 1 - i; }
+      if (a < 0) { a = 0; c = 1 - i; }
     }
-    const S = i+c+a;
-    return { fi:i/S, fc:c/S, fa:a/S };
+    const S = i + c + a;
+    if (S <= 0) return { fin: INF_MIN_PCT, fcav: CAV_MIN_PCT, farc: 1 - INF_MIN_PCT - CAV_MIN_PCT };
+    return { fin: i/S, fcav: c/S, farc: a/S };
   }
 
-  // ================ ARCHER PRIORITY LOGIC ================
-  function allocateArchersToJoins(stock, X, joinCap, minInfPct, minCavPct) {
-    const s = cloneStock(stock);
-    const joins = [];
-    for (let i = 0; i < X; i++) {
-      if (joinCap <= 0) { joins.push({ inf: 0, cav: 0, arc: 0 }); continue; }
-      const minInf = Math.ceil(joinCap * minInfPct);
-      const minCav = Math.ceil(joinCap * minCavPct);
-      const p = { inf: Math.min(s.inf, minInf), cav: Math.min(s.cav, minCav), arc: 0 };
-      s.inf -= p.inf; s.cav -= p.cav;
-      const remaining = joinCap - (p.inf + p.cav);
-      p.arc = Math.min(s.arc, Math.max(0, remaining));
-      s.arc -= p.arc;
-      joins.push(p);
-    }
-    return { joins, leftover: s };
+  // ---------- Closed-form optimal fractions ----------
+  function computeExactOptimalFractions(stats, tierRaw) {
+    const Ainf = attackFactor(stats.inf_atk, stats.inf_let);
+    const Acav = attackFactor(stats.cav_atk, stats.cav_let);
+    const Aarc = attackFactor(stats.arc_atk, stats.arc_let);
+    const KARC = getArcherCoefByTier(tierRaw);
+    const alpha = Ainf / 1.12;
+    const beta  = Acav;
+    const gamma = KARC * Aarc;
+    const a2 = alpha*alpha, b2 = beta*beta, g2 = gamma*gamma;
+    const sum = a2 + b2 + g2;
+    return { fin: a2/sum, fcav: b2/sum, farc: g2/sum };
   }
-  function allocateArchersToCall(stock, rallySize, infMin, infMax, cavMin) {
-    const s = cloneStock(stock);
-    if (rallySize <= 0) return { rally: { inf: 0, cav: 0, arc: 0 }, leftover: s };
-    const minInf = Math.ceil(rallySize * infMin);
-    const minCav = Math.ceil(rallySize * cavMin);
-    let inf = Math.min(s.inf, minInf); s.inf -= inf;
-    let cav = Math.min(s.cav, minCav); s.cav -= cav;
-    let used = inf + cav;
-    let space = rallySize - used;
-    let arc = Math.min(s.arc, space); s.arc -= arc; used += arc; space = rallySize - used;
-    if (space > 0) { const extraCav = Math.min(s.cav, space); cav += extraCav; s.cav -= extraCav; used += extraCav; space = rallySize - used; }
-    if (space > 0) { const extraInf = Math.min(s.inf, space); inf += extraInf; s.inf -= extraInf; }
-    return { rally: { inf, cav, arc }, leftover: s };
+
+  // ---------- Plot Evaluation ----------
+  function evaluateForPlot(fin, fcav, farc, stats, tierRaw) {
+    const Ainf = attackFactor(stats.inf_atk, stats.inf_let);
+    const Acav = attackFactor(stats.cav_atk, stats.cav_let);
+    const Aarc = attackFactor(stats.arc_atk, stats.arc_let);
+    const KARC = getArcherCoefByTier(tierRaw);
+    const termInf = (1/1.45) * Ainf * Math.sqrt(fin);
+    const termCav = Acav * Math.sqrt(fcav);
+    const termArc = KARC * Aarc * Math.sqrt(farc);
+    return termInf + termCav + termArc;
   }
-  function planArcherPriorityAlloc(stock0, rallySize, X, joinCap, infMin, infMax, cavMin) {
-    const s = cloneStock(stock0);
-    const phase1 = allocateArchersToJoins(s, X, joinCap, infMin, cavMin);
-    const joins = phase1.joins;
-    const remaining = phase1.leftover;
-    const phase2 = allocateArchersToCall(remaining, rallySize, infMin, infMax, cavMin);
-    const rally = phase2.rally;
-    const finalLeftover = phase2.leftover;
-    const totalUsed = sumTroops(rally) + joins.reduce((sum, p) => sum + sumTroops(p), 0);
-    const TT = Math.max(1, totalUsed);
-    const allTroops = { inf: 0, cav: 0, arc: 0 };
-    allTroops.inf = rally.inf + joins.reduce((sum, p) => sum + p.inf, 0);
-    allTroops.cav = rally.cav + joins.reduce((sum, p) => sum + p.cav, 0);
-    allTroops.arc = rally.arc + joins.reduce((sum, p) => sum + p.arc, 0);
-    const fractions = { i: allTroops.inf / TT, c: allTroops.cav / TT, a: allTroops.arc / TT };
-    return {
-      rally, packs: joins, leftover: finalLeftover, fractions,
-      stats: { usedInf: allTroops.inf, usedCav: allTroops.cav, usedArc: allTroops.arc, arcReduction: stock0.arc - finalLeftover.arc }
-    };
-  }
-  function improveArcherUtilization(rally, joins, leftover, joinCap, maxInfPct) {
-    const lo = cloneStock(leftover);
-    for (let i = 0; i < joins.length; i++) {
-      const march = joins[i];
-      const marchTotal = march.inf + march.cav + march.arc;
-      if (marchTotal >= joinCap) continue;
-      const space = joinCap - marchTotal;
-      const canRemoveInf = march.inf - Math.ceil(joinCap * maxInfPct);
-      if (canRemoveInf > 0 && lo.arc > 0) {
-        const transfer = Math.min(canRemoveInf, lo.arc, space);
-        march.inf -= transfer; march.arc += transfer; lo.arc -= transfer;
+
+  // ---------- Composition helpers ----------
+  function roundFractionsTo100(fin, fcav, farc) {
+    const S = fin+fcav+farc;
+    if (S <= 0) return { i:0, c:0, a:100 };
+    const nf = fin/S, nc = fcav/S;
+    let i = Math.round(nf*100);
+    let c = Math.round(nc*100);
+    let a = 100 - i - c;
+    if (a < 0) {
+      a = 0;
+      if (i + c > 100) {
+        const over = i + c - 100;
+        if (i >= c) i -= over; else c -= over;
       }
     }
-    return lo;
+    return { i, c, a };
   }
-  // ================ END ARCHER PRIORITY LOGIC ================
+  function formatTriplet(fin, fcav, farc) {
+    const {i,c,a} = roundFractionsTo100(fin,fcav,farc);
+    return `${i}/${c}/${a}`;
+  }
 
-  // ------------------- Magic Ratio planning -------------------
-  function coeffsByTier(tierKey){
-    const t = TIERS?.tiers?.[tierKey];
-    if(!t) return {inf:1, cav:1, arc:1};
-    return {
-      inf: perTroopAttack(t.inf[0]) / BEAR_DEF_PER_TROOP / 100 * SKILLMOD_INF,
-      cav: perTroopAttack(t.cav[0]) / BEAR_DEF_PER_TROOP / 100 * SKILLMOD_CAV,
-      arc: perTroopAttack(t.arc[0]) / BEAR_DEF_PER_TROOP / 100 * SKILLMOD_ARC
-    };
+  // ---------- Format fractions to 1-decimal string (e.g. "8.5/12.3/79.2") ----------
+  function formatTriplet1dp(fin, fcav, farc) {
+    const S = fin + fcav + farc;
+    if (S <= 0) return "0.0/0.0/100.0";
+    const ip = (fin / S) * 100;
+    const cp = (fcav / S) * 100;
+    const ap = (farc / S) * 100;
+    // Round to 1dp, then correct rounding error on the largest component
+    let is = ip.toFixed(1);
+    let cs = cp.toFixed(1);
+    let as_ = ap.toFixed(1);
+    // Ensure they sum to exactly 100.0
+    const diff = (100 - parseFloat(is) - parseFloat(cs) - parseFloat(as_));
+    if (Math.abs(diff) >= 0.05) {
+      // absorb rounding error into archers (largest share usually)
+      as_ = (parseFloat(as_) + diff).toFixed(1);
+    }
+    return `${is}/${cs}/${as_}`;
   }
-  function magicWeightsSquared(tierKey, mode){
-    const K = coeffsByTier(tierKey);
-    const mult = (mode === 'magic12') ? {inf:1, cav:1, arc:2} : {inf:1, cav:1, arc:1};
-    return {
-      wInf: (K.inf * mult.inf) ** 2,
-      wCav: (K.cav * mult.cav) ** 2,
-      wArc: (K.arc * mult.arc) ** 2
-    };
+
+  // ---------- Parse fractions from actual troop counts ----------
+  function fractionsFromCounts(inf, cav, arc) {
+    const total = inf + cav + arc;
+    if (total <= 0) return { fin: INF_MIN_PCT, fcav: CAV_MIN_PCT, farc: 1 - INF_MIN_PCT - CAV_MIN_PCT };
+    return { fin: inf / total, fcav: cav / total, farc: arc / total };
   }
-  function planMagicAlloc(mode, stockIn, rallySize, X, cap, tierKey){
-    const s = cloneStock(stockIn);
-    const R = Math.max(0, rallySize|0);
-    const C = Math.max(0, cap|0);
-    const Xn = Math.max(0, X|0);
-    const T = R + Xn * C;
-    const { wInf, wCav, wArc } = magicWeightsSquared(tierKey, mode);
-    const sumW = Math.max(1e-9, wInf + wCav + wArc);
-    const base = { inf: T * (wInf / sumW), cav: T * (wCav / sumW), arc: T * (wArc / sumW) };
-    let target = {
-      inf: Math.min(s.inf, Math.round(base.inf)),
-      cav: Math.min(s.cav, Math.round(base.cav)),
-      arc: Math.min(s.arc, Math.round(base.arc))
-    };
-    let used = target.inf + target.cav + target.arc;
-    let deficit = T - used;
-    const prio = [['arc', wArc], ['cav', wCav], ['inf', wInf]].sort((a,b)=>b[1]-a[1]);
-    while (deficit > 0) {
-      let progressed = false;
-      for (const [k] of prio) {
-        const free = s[k] - target[k];
-        if (free <= 0) continue;
-        const give = Math.min(free, deficit);
-        target[k] += give; deficit -= give; progressed = true;
-        if (deficit <= 0) break;
+
+  function parseCompToFractions(str) {
+    if (typeof str !== "string") return null;
+    const parts = str.replace(/%/g,"").trim()
+      .split(/[,\s/]+/).map(s=>s.trim()).filter(Boolean).map(Number);
+    if (parts.some(v=>!Number.isFinite(v) || v<0)) return null;
+    if (parts.length === 0) return null;
+    let i = parts[0] ?? 0;
+    let c = parts[1] ?? 0;
+    let a = parts.length >= 3 ? parts[2] : Math.max(0, 100 - (i+c));
+    const sum = i+c+a;
+    if (sum <= 0) return null;
+    return { fin: i/sum, fcav: c/sum, farc: a/sum };
+  }
+  function getCompEl(){ return document.getElementById("compInput"); }
+  function getCompHintEl(){ return document.getElementById("compHint"); }
+
+  function setCompInputFromBest() {
+    const el = getCompEl();
+    if (!el) return;
+    el.value = formatTriplet(lastBestTriplet.fin, lastBestTriplet.fcav, lastBestTriplet.farc);
+    const hint = getCompHintEl();
+    if (hint) hint.textContent = "Auto-filled from Best (bounded). Edit to override.";
+  }
+  function getFractionsForRally() {
+    const el = getCompEl();
+    const hint = getCompHintEl();
+
+    // If field is empty → use last engine call fractions as fallback, or bestTriplet
+    if (!el || el.value.trim() === '') {
+      const fallback = _lastEngineCallFractions || lastBestTriplet;
+      if (hint) hint.textContent = "Using engine default (field cleared).";
+      return fallback;
+    }
+
+    if (!el) return lastBestTriplet;
+    const parsed = parseCompToFractions(el.value);
+    if (parsed) {
+      const bounded = enforceCompositionBounds(parsed.fin,parsed.fcav,parsed.farc);
+      const disp = formatTriplet(bounded.fin,bounded.fcav,bounded.farc);
+      if (hint) {
+        const orig = formatTriplet(parsed.fin,parsed.fcav,parsed.farc);
+        hint.textContent = (orig !== disp)
+          ? `Using (clamped): ${disp} · (Inf 7.5–10%, Cav ≥ 10%)`
+          : `Using: ${disp}`;
       }
-      if (!progressed) break;
-    }
-    const TT = Math.max(1, target.inf + target.cav + target.arc);
-    const frac = { i: target.inf/TT, c: target.cav/TT, a: target.arc/TT };
-    const rally = { inf: Math.min(s.inf, Math.round(frac.i * R)), cav: Math.min(s.cav, Math.round(frac.c * R)), arc: 0 };
-    rally.arc = Math.min(s.arc, R - (rally.inf + rally.cav));
-    s.inf -= rally.inf; s.cav -= rally.cav; s.arc -= rally.arc;
-    const joins = [];
-    for (let i = 0; i < Xn; i++) {
-      if (C <= 0) { joins.push({inf:0,cav:0,arc:0}); continue; }
-      const m = { inf: Math.min(s.inf, Math.round(frac.i * C)), cav: Math.min(s.cav, Math.round(frac.c * C)), arc: 0 };
-      m.arc = Math.min(s.arc, C - (m.inf + m.cav));
-      s.inf -= m.inf; s.cav -= m.cav; s.arc -= m.arc;
-      joins.push(m);
-    }
-    return { rally, packs: joins, leftover: s, fractions: frac };
-  }
-
-  // ================================================================
-  // NEW RECOMMENDATION ENGINE
-  // Uses the actual fractions computed for this run to simulate joins.
-  // Gate 1: march headcount ≥ 85% of cap (REC_FILL_GATE)
-  // Gate 2: troop quality checks:
-  //   a) mostly infantry with no archers (arc===0 AND inf > cav)
-  //   b) missing cavalry entirely (cav===0)
-  //   c) archer share < 10%
-  //   d) any single troop type > 80%
-  // Returns: highest N (1..maxN) where ALL N marches pass BOTH gates.
-  // If no N passes, returns 0 with a descriptive reason.
-  // ================================================================
-  function evaluateMarchQuality(p, cap) {
-    const total = (p.inf|0) + (p.cav|0) + (p.arc|0);
-    const failures = [];
-
-    // Gate 1: fill
-    const fill = cap > 0 ? total / cap : 0;
-    if (fill < REC_FILL_GATE) {
-      failures.push(`fill ${(fill*100).toFixed(0)}%<85%`);
-    }
-
-    if (total > 0) {
-      // Gate 2a: mostly infantry, no archers
-      if (p.arc === 0 && p.inf > p.cav) {
-        failures.push('inf-only');
-      }
-      // Gate 2b: missing cavalry
-      if (p.cav === 0) {
-        failures.push('no-cav');
-      }
-      // Gate 2c: archer share < 10%
-      const arcPct = p.arc / total;
-      if (arcPct < REC_ARC_MIN_PCT) {
-        failures.push(`arc ${(arcPct*100).toFixed(0)}%<10%`);
-      }
-      // Gate 2d: any single type > 80%
-      const infPct = p.inf / total;
-      const cavPct = p.cav / total;
-      if (infPct > REC_MAX_SINGLE) failures.push(`inf ${(infPct*100).toFixed(0)}%>80%`);
-      if (cavPct > REC_MAX_SINGLE) failures.push(`cav ${(cavPct*100).toFixed(0)}%>80%`);
-      if (arcPct > REC_MAX_SINGLE) failures.push(`arc ${(arcPct*100).toFixed(0)}%>80%`);
-    }
-
-    return { pass: failures.length === 0, failures };
-  }
-
-  // Simulate N join marches using the same proportional fractions as the actual run.
-  // stockAfterCall = remaining stock after the call rally was built.
-  function simulateJoinsForRec(stockAfterCall, n, cap, fractions) {
-    const s = cloneStock(stockAfterCall);
-    const fi = fractions.i ?? 0;
-    const fc = fractions.c ?? 0;
-    const fa = fractions.a ?? 0;
-    const W = Math.max(1e-9, fi + fc + fa);
-    const packs = [];
-    for (let i = 0; i < n; i++) {
-      if (cap <= 0) { packs.push({ inf:0, cav:0, arc:0 }); continue; }
-      const tInf = Math.round((fi / W) * cap);
-      const tCav = Math.round((fc / W) * cap);
-      const p = {
-        inf: Math.min(s.inf, tInf),
-        cav: Math.min(s.cav, tCav),
-        arc: 0
-      };
-      const rem = cap - p.inf - p.cav;
-      p.arc = Math.min(s.arc, Math.max(0, rem));
-      s.inf -= p.inf; s.cav -= p.cav; s.arc -= p.arc;
-      packs.push(p);
-    }
-    return packs;
-  }
-
-  // Main recommendation function.
-  // rally       = the actual built call rally
-  // stockAfterCall = stock remaining after call rally was deducted
-  // fractions   = { i, c, a } fractions used for the actual run
-  // maxN        = user's # of marches input
-  // cap         = join cap
-  function recommendMarchCount(rally, stockAfterCall, fractions, maxN, cap) {
-    let bestN = 0;
-    const details = [];
-
-    for (let n = 1; n <= Math.max(1, maxN|0); n++) {
-      const packs = simulateJoinsForRec(stockAfterCall, n, cap, fractions);
-      let allPass = true;
-      const packResults = [];
-
-      for (let i = 0; i < packs.length; i++) {
-        const { pass, failures } = evaluateMarchQuality(packs[i], cap);
-        packResults.push({ march: i + 1, pass, failures });
-        if (!pass) allPass = false;
-      }
-
-      details.push({ n, allPass, packs: packResults });
-      if (allPass) bestN = n;
-      // Keep going — we want the HIGHEST N where all pass
-    }
-
-    return { bestN, details };
-  }
-
-  // ================================================================
-  // END NEW RECOMMENDATION ENGINE
-  // ================================================================
-
-  // ------------------- Rendering -------------------
-  function renderCallTable(r){
-    $("callRallyTable").innerHTML = `
-      <table>
-        <thead>
-          <tr><th>Type</th><th>Infantry</th><th>Cavalry</th><th>Archers</th><th>Total</th></tr>
-        </thead>
-        <tbody>
-          <tr style="background:#162031;">
-            <td><strong>CALL</strong></td>
-            <td>${r.inf}</td>
-            <td>${r.cav}</td>
-            <td>${r.arc}</td>
-            <td>${sumTroops(r)}</td>
-          </tr>
-        </tbody>
-      </table>
-    `;
-  }
-  function renderJoinTable(joins){
-    let out = `
-      <table>
-        <thead>
-          <tr><th>#</th><th>Infantry</th><th>Cavalry</th><th>Archers</th><th>Total</th></tr>
-        </thead>
-        <tbody>
-    `;
-    joins.forEach((p,i)=>{
-      out += `
-        <tr>
-          <td>#${i+1}</td>
-          <td>${p.inf}</td>
-          <td>${p.cav}</td>
-          <td>${p.arc}</td>
-          <td>${sumTroops(p)}</td>
-        </tr>
-      `;
-    });
-    out += `</tbody></table>`;
-    $("joinTableWrap").innerHTML = out;
-  }
-
-  function renderFinalScoreboard(rally, joins, tierKey) {
-    const callDmg  = computeFormationDamage(rally, tierKey);
-    const callScore = callDmg.finalScore;
-    let joinScore = 0;
-    for (const p of joins) { joinScore += computeFormationDamage(p, tierKey).finalScore; }
-    const totalScore = callScore + joinScore;
-    const callTotal = Math.max(1, sumTroops(rally));
-    const callFrac = { i: rally.inf / callTotal, c: rally.cav / callTotal, a: rally.arc / callTotal };
-    let jInf = 0, jCav = 0, jArc = 0;
-    for (const p of joins) { jInf += p.inf; jCav += p.cav; jArc += p.arc; }
-    const joinTotal = Math.max(1, jInf + jCav + jArc);
-    const joinFrac = { i: jInf / joinTotal, c: jCav / joinTotal, a: jArc / joinTotal };
-    const callTrip = toPctTriplet(callFrac);
-    const joinTrip = toPctTriplet(joinFrac);
-    let html = `
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>CALL formation</th>
-            <th>CALL score</th>
-            <th>JOIN formation</th>
-            <th>JOIN score</th>
-            <th>Total score</th>
-          </tr>
-        </thead>
-        <tbody>
-    `;
-    html += `
-      <tr>
-        <td>✅ Final</td>
-        <td>${callTrip}</td>
-        <td>${callScore.toLocaleString()}</td>
-        <td>${joinTrip}</td>
-        <td>${joinScore.toLocaleString()}</td>
-        <td><strong>${totalScore.toLocaleString()}</strong></td>
-      </tr>
-    `;
-    html += `</tbody></table>`;
-    $("scoreboardTableWrap").innerHTML = html;
-  }
-
-  // Hybrid Post-fix (unchanged)
-  function ensureMinInf(march, minInf, stockLeftover){
-    if (march.inf >= minInf) return;
-    let need = minInf - march.inf;
-    if (stockLeftover.inf > 0) { const take = Math.min(stockLeftover.inf, need); march.inf += take; stockLeftover.inf -= take; need -= take; }
-    if (need > 0) { const fromCav = Math.min(march.cav, need); march.cav -= fromCav; march.inf += fromCav; need -= fromCav; }
-    if (need > 0) { const fromArc = Math.min(march.arc, need); march.arc -= fromArc; march.inf += fromArc; need -= fromArc; }
-  }
-  function adjustCallRallyCapsAndBias(rally, leftover, rallySize, opts = {}) {
-    const minInf = Math.ceil(rallySize * MIN_INF_PCT_MARCH);
-    const maxInf = Math.floor(rallySize * (opts.maxInfPct ?? 0.20));
-    const maxCav = Math.floor(rallySize * (opts.maxCavPct ?? 0.30));
-    if (rally.inf < minInf) {
-      let need = minInf - rally.inf;
-      if (leftover.inf > 0) { const take = Math.min(leftover.inf, need); rally.inf += take; leftover.inf -= take; need -= take; }
-      if (need > 0) { const fromCav = Math.min(rally.cav, need); rally.cav -= fromCav; rally.inf += fromCav; need -= fromCav; }
-      if (need > 0) { const fromArc = Math.min(rally.arc, need); rally.arc -= fromArc; rally.inf += fromArc; need -= fromArc; }
-    }
-    function swapIntoArc(fromKey, amount) {
-      if (amount <= 0 || leftover.arc <= 0) return 0;
-      const give = Math.min(amount, leftover.arc);
-      rally[fromKey] -= give; rally.arc += give; leftover.arc -= give; leftover[fromKey] += give;
-      return give;
-    }
-    if (rally.inf > maxInf) {
-      let cut = rally.inf - maxInf;
-      const arcTaken = swapIntoArc("inf", cut); cut -= arcTaken;
-      if (cut > 0 && rally.cav < maxCav && leftover.cav > 0) {
-        const cavRoom = maxCav - rally.cav;
-        const give = Math.min(cut, cavRoom, leftover.cav);
-        rally.inf -= give; rally.cav += give; leftover.cav -= give; leftover.inf += give; cut -= give;
-      }
-    }
-    if (rally.cav > maxCav) {
-      let cut = rally.cav - maxCav;
-      const arcFromCav = swapIntoArc("cav", cut); cut -= arcFromCav;
-      if (cut > 0 && rally.inf < minInf) {
-        const room = minInf - rally.inf;
-        const give = Math.min(cut, room);
-        rally.cav -= give; rally.inf += give; leftover.cav += give; cut -= give;
-      }
-    }
-    const biasPct = opts.arcBiasPct ?? 0.03;
-    let want = Math.max(0, Math.ceil(rallySize * biasPct));
-    if (want > 0 && leftover.arc > 0) {
-      if (rally.inf > minInf) {
-        const canReduceInf = rally.inf - minInf;
-        const takeFromInf = Math.min(canReduceInf, want, leftover.arc);
-        rally.inf -= takeFromInf; rally.arc += takeFromInf; leftover.arc -= takeFromInf; leftover.inf += takeFromInf; want -= takeFromInf;
-      }
-      if (want > 0 && rally.cav > 0 && leftover.arc > 0) {
-        const takeFromCav = Math.min(rally.cav, want, leftover.arc);
-        rally.cav -= takeFromCav; rally.arc += takeFromCav; leftover.arc -= takeFromCav; leftover.cav += takeFromCav; want -= takeFromCav;
-      }
-    }
-    if (rally.inf < minInf) {
-      const need = minInf - rally.inf;
-      const fromArc = Math.min(rally.arc, need); rally.arc -= fromArc; rally.inf += fromArc;
-      let still = need - fromArc;
-      if (still > 0) { const fromCav = Math.min(rally.cav, still); rally.cav -= fromCav; rally.inf += fromCav; }
+      return bounded;
+    } else {
+      if (hint) hint.textContent = "Invalid input → using Best (bounded).";
+      return lastBestTriplet;
     }
   }
-  function applyPriorityPostFix(rally, joins, leftover, rallySize, joinCap){
-    const marches = [rally, ...joins];
-    const mins = [Math.ceil(rallySize * MIN_INF_PCT_MARCH)];
-    for (let i=0; i<joins.length; i++){ mins.push(Math.ceil(joinCap * MIN_INF_PCT_MARCH)); }
-    for (let i=0; i<marches.length; i++){ ensureMinInf(marches[i], mins[i], leftover); }
-    const types = ["arc", "cav"];
-    for (const t of types){
-      if (leftover[t] <= 0) continue;
-      let progressed = true;
-      while (leftover[t] > 0 && progressed) {
-        progressed = false;
-        for (let i=0; i<marches.length; i++){
-          const m = marches[i];
-          const minInf = mins[i];
-          const before = m.inf + m.cav + m.arc;
-          let excess = Math.max(0, m.inf - minInf);
-          if (excess <= 0) continue;
-          const give = Math.min(excess, leftover[t]);
-          if (give <= 0) continue;
-          m.inf -= give; m[t] += give; leftover[t] -= give; leftover.inf += give;
-          const after = m.inf + m.cav + m.arc;
-          if (after === before) progressed = true;
-          if (leftover[t] <= 0) break;
+  function getJoinFractionsManual() {
+    const el = document.getElementById("compInputJoin");
+    const hint = document.getElementById("compHintJoin");
+    if (!el) return null;
+
+    // KEY FIX: Only honour manual override when the user has EXPLICITLY typed.
+    // Engine-written readback values must NEVER be treated as manual overrides.
+    // Doing so causes a feedback loop: readback writes "1/19/80" → next compute
+    // parses it as manual → buildJoinManually runs on depleted stock → 100/0/0.
+    if (!compJoinUserEdited) {
+      return null; // always use arc-first engine when user has not typed
+    }
+
+    // If user cleared the field, reset flag and fall back to engine
+    if (el.value.trim() === '') {
+      compJoinUserEdited = false;
+      if (hint) hint.textContent = "Using engine default (field cleared).";
+      return null;
+    }
+
+    const parsed = parseCompToFractions(el.value);
+    if (parsed) {
+        const disp = formatTriplet(parsed.fin, parsed.fcav, parsed.farc);
+        if (hint) hint.textContent = `Using: ${disp}`;
+        return parsed;
+    } else {
+        if (hint) hint.textContent = `Invalid input → using engine logic`;
+        return null;
+    }
+  }
+
+  // ---------- COMPOSITION READBACK ENGINE ----------
+  // Called at the very end of onOptimize() after all formations are built.
+  // Reads actual troop counts from the built rally and first join pack,
+  // converts to 1-decimal percentages, and writes back to the input fields
+  // ONLY if the user has NOT manually edited them.
+  // Uses _readbackWriting guard so the input listeners don't treat
+  // programmatic writes as user edits (which would cause a feedback loop).
+  function readbackCompositionFields(rally, joinPacks) {
+    _readbackWriting = true;
+    try {
+      // --- CALL field ---
+      const callEl = getCompEl();
+      if (callEl) {
+        const callTotal = (rally.inf || 0) + (rally.cav || 0) + (rally.arc || 0);
+        if (callTotal > 0) {
+          const frac = fractionsFromCounts(rally.inf, rally.cav, rally.arc);
+          _lastEngineCallFractions = frac;
+          if (!compUserEdited) {
+            callEl.value = formatTriplet1dp(frac.fin, frac.fcav, frac.farc);
+            const hint = getCompHintEl();
+            if (hint) hint.textContent = "Auto-filled from actual rally formation (1 decimal).";
+          }
+          // Update bestReadout banner from ACTUAL call fractions (last in chain — display only)
+          const actualDisp = compUserEdited
+            ? callEl.value
+            : formatTriplet1dp(frac.fin, frac.fcav, frac.farc);
+          const bestReadoutEl = document.getElementById("bestReadout");
+          if (bestReadoutEl) {
+            bestReadoutEl.innerText =
+              `Best Call Rally Composition ≈ ${actualDisp} (Inf/Cav/Arc) · [Inf 7.5–10%, Cav ≥ 10%].`;
+          }
         }
       }
+
+      // --- JOIN field ---
+      // Only write back when the arc-first engine was used (compJoinUserEdited = false).
+      // When user has typed a manual override, leave the join field alone.
+      const joinEl = document.getElementById("compInputJoin");
+      if (joinEl && joinPacks && joinPacks.length > 0 && !compJoinUserEdited) {
+        const p0 = joinPacks[0];
+        const joinTotal = (p0.inf || 0) + (p0.cav || 0) + (p0.arc || 0);
+        if (joinTotal > 0) {
+          const frac = fractionsFromCounts(p0.inf, p0.cav, p0.arc);
+          _lastEngineJoinFractions = frac;
+          joinEl.value = formatTriplet1dp(frac.fin, frac.fcav, frac.farc);
+          const hint = document.getElementById("compHintJoin");
+          if (hint) hint.textContent = "Auto-filled from Join #1 actual formation (1 decimal).";
+        }
+      }
+    } finally {
+      _readbackWriting = false;
     }
   }
-  function deriveJoinFractions(joins){
-    let I=0,C=0,A=0;
-    for (const p of joins){ I+=p.inf; C+=p.cav; A+=p.arc; }
-    const S = Math.max(1, I+C+A);
-    return { i: I/S, c: C/S, a: A/S };
+
+  // ---------- Plot Rendering ----------
+  function percentile(arr, p) {
+    const a = [...arr].sort((x, y) => x - y);
+    const idx = (a.length - 1) * p;
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    if (lo === hi) return a[lo];
+    const w = idx - lo;
+    return a[lo] * (1 - w) + a[hi] * w;
   }
-  function* generateTriplets(bounds, stepPct){
-    const step = Math.max(1, stepPct|0);
-    for (let i=bounds.infMin; i<=bounds.infMax; i+=step){
-      for (let c=bounds.cavMin; c<=bounds.cavMax; c+=step){
-        const a = 100 - i - c;
-        if (a < bounds.arcMin) continue;
-        if (a > bounds.arcMax) continue;
-        if (a < 0) continue;
-        yield { i:i/100, c:c/100, a:a/100, label:`${i}/${c}/${a}` };
+
+  function computePlots() {
+    const stats = {
+      inf_atk: num("inf_atk"),
+      inf_let: num("inf_let"),
+      cav_atk: num("cav_atk"),
+      cav_let: num("cav_let"),
+      arc_atk: num("arc_atk"),
+      arc_let: num("arc_let")
+    };
+    const tierRaw = document.getElementById("troopTier").value;
+
+    const opt = computeExactOptimalFractions(stats, tierRaw);
+    const bounded = enforceCompositionBounds(opt.fin, opt.fcav, opt.farc);
+    lastBestTriplet = { fin: bounded.fin, fcav: bounded.fcav, farc: bounded.farc };
+    if (!compUserEdited) setCompInputFromBest();
+
+    const samples = [];
+    const vals = [];
+    const steps = 55;
+    for (let i = 0; i <= steps; i++) {
+      for (let j = 0; j <= steps - i; j++) {
+        const fin = i / steps;
+        const fcav = j / steps;
+        const farc = 1 - fin - fcav;
+        const d = evaluateForPlot(fin, fcav, farc, stats, tierRaw);
+        samples.push({ fin, fcav, farc, d });
+        vals.push(d);
       }
     }
-  }
-  function simulateTriplet(tierKey, stock0, rallySize, X, joinCap, triplet){
-    const cr = buildCallRally("ratio11", stock0, rallySize, tierKey, triplet);
-    const jr = buildJoinRallies("ratio11", cr.stockAfter, X, joinCap, tierKey, triplet);
-    const rally = cr.rally;
-    const joins = jr.packs;
-    const leftover = jr.leftover;
-    const lo = { inf:leftover.inf, cav:leftover.cav, arc:leftover.arc };
-    applyPriorityPostFix(rally, joins, lo, rallySize, joinCap);
-    const callScore = computeFormationDamage(rally, tierKey).finalScore;
-    let joinScore = 0; for (const p of joins) joinScore += computeFormationDamage(p, tierKey).finalScore;
-    const usedCallFrac = (()=>{ const T = Math.max(1, rally.inf + rally.cav + rally.arc); return { i:rally.inf/T, c:rally.cav/T, a:rally.arc/T }; })();
-    const usedJoinFrac = deriveJoinFractions(joins);
-    return { call: rally, joins, leftover: lo, callScore, joinScore, totalScore: callScore + joinScore, usedCallFrac, usedJoinFrac };
-  }
-  function findTopSetups(tierKey, stock0, rallySize, X, joinCap, opts={}){
-    const CAV_MIN_PCT_SWEEP = 10;
-    const bounds = {
-      infMin: Math.round(MIN_INF_PCT_MARCH*100),
-      infMax: 40,
-      cavMin: CAV_MIN_PCT_SWEEP,
-      cavMax: 45,
-      arcMin: 0,
-      arcMax: 100
+    const vmax = Math.max(...vals);
+    const rel = vals.map(v => v / (vmax || 1));
+    const vminClip = percentile(rel, 0.05);
+    const vmaxClip = percentile(rel, 0.95);
+
+    const fieldTrace = {
+      type: "scatterternary",
+      mode: "markers",
+      a: samples.map(s => s.fin),
+      b: samples.map(s => s.fcav),
+      c: samples.map(s => s.farc),
+      marker: {
+        size: 3, opacity: 0.95,
+        color: rel, colorscale: "Viridis",
+        cmin: vminClip, cmax: vmaxClip,
+        line: { width: 0 },
+        colorbar: {
+          thickness: 14, len: 0.6, tickformat: ".2f",
+          x: 0.5, xanchor: "center", y: -0.15, yanchor: "top",
+          orientation: "h",
+        }
+      },
+      hovertemplate:
+        "<b>Inf</b>: %{a:.2f}<br>" +
+        "<b>Cav</b>: %{b:.2f}<br>" +
+        "<b>Arc</b>: %{c:.2f}<br>" +
+        "<b>Rel</b>: %{marker.color:.3f}<extra></extra>",
+      name: "Surface"
     };
-    const stepPct = Math.min(Math.max(1, opts.stepPct || 1), 5);
+
+    const bestTrace = {
+      type: "scatterternary",
+      mode: "markers+text",
+      a: [bounded.fin], b: [bounded.fcav], c: [bounded.farc],
+      marker: { size: 12, color: "#10b981", line: { color: "white", width: 1.6 } },
+      text: ["Best"], textposition: "top center",
+      hovertemplate: "Best (bounded)<br>Inf: %{a:.2f}<br>Cav: %{b:.2f}<br>Arc: %{c:.2f}<extra></extra>",
+      name: "Best"
+    };
+
+    const layout = {
+      template: "plotly_dark",
+      paper_bgcolor: "#1a1d24",
+      plot_bgcolor: "#1a1d24",
+      font: { color: "#e8eaed", size: 13 },
+      margin: { l: 36, r: 40, b: 100, t: 52 },
+      title: { text: "Optimal Troop Composition", x: 0.02, font: { size: 20 } },
+      showlegend: false,
+      ternary: {
+        sum: 1,
+        bgcolor: "#0f1116",
+        domain: { x: [0.02, 0.96], y: [0.15, 0.98] },
+        aaxis: { title: { text: "Infantry" }, min: 0, ticks: "outside", tickformat: ".1f", ticklen: 4, gridcolor: "#3A3F45" },
+        baxis: { title: { text: "Cavalry" }, min: 0, ticks: "outside", tickformat: ".1f", ticklen: 4, gridcolor: "#3A3F45" },
+        caxis: { title: { text: "Archery" }, min: 0, ticks: "outside", tickformat: ".1f", ticklen: 4, gridcolor: "#3A3F45" }
+      }
+    };
+
+    Plotly.react("ternaryPlot", [fieldTrace, bestTrace], layout, { responsive: true, displayModeBar: false });
+
+    const el = document.getElementById("ternaryPlot");
+    if (!window.__ternaryResizeAttached) {
+      const ro = new ResizeObserver(() => Plotly.Plots.resize(el));
+      ro.observe(el);
+      window.__ternaryResizeAttached = true;
+    }
+
+    document.getElementById("bestReadout").innerText =
+      `Best Call Rally Composition ≈ ${formatTriplet(bounded.fin,bounded.fcav,bounded.farc)} (Inf/Cav/Arc) · [Inf 7.5–10%, Cav ≥ 10%].`;
+
+    updateRecommendedDisplay();
+  }
+
+// ---------- Rally Build — allocates proportionally to fractions, then clamps to bounds ----------
+// fractions = { fin, fcav, farc } from the plot/optimizer (the actual optimal ratios).
+// Bounds: INF 7.5–10%, CAV ≥ 10%. Remaining space after placing inf+cav goes to archers.
+// If archers run short, excess space is filled by cav first, then inf (up to 10%).
+function buildRally(fractions, rallySize, stock) {
+
+  if (rallySize <= 0)
+    return { inf: 0, cav: 0, arc: 0 };
+
+  const iMin = Math.ceil(INF_MIN_PCT * rallySize);
+  const iMax = Math.floor(INF_MAX_PCT * rallySize);
+  const cMin = Math.ceil(CAV_MIN_PCT * rallySize);
+
+  // Step 1: Target amounts from optimizer fractions, clamped to bounds and stock.
+  // Infantry: clamp to [iMin, iMax], also limited by stock
+  let inf = Math.min(stock.inf, Math.max(iMin, Math.min(iMax, Math.round(fractions.fin * rallySize))));
+
+  // Cavalry: at least cMin, target from fractions, limited by stock
+  let cav = Math.min(stock.cav, Math.max(cMin, Math.round(fractions.fcav * rallySize)));
+
+  // If inf + cav already exceed rally size (shouldn't happen with sane fractions but be safe)
+  if (inf + cav > rallySize) {
+    // Scale back cav first, keeping cMin
+    cav = Math.max(cMin, rallySize - inf);
+  }
+
+  // Step 2: Fill remaining space with archers
+  let arc = Math.min(stock.arc, Math.max(0, rallySize - inf - cav));
+  let used = inf + cav + arc;
+
+  // Step 3: If archers ran out before filling cap, top up with extra cavalry
+  if (used < rallySize && stock.cav - cav > 0) {
+    const add = Math.min(rallySize - used, stock.cav - cav);
+    cav += add;
+    used += add;
+  }
+
+  // Step 4: If still space, top up with extra infantry (up to iMax)
+  if (used < rallySize && stock.inf - inf > 0) {
+    const add = Math.min(rallySize - used, stock.inf - inf, Math.max(0, iMax - inf));
+    inf += add;
+    used += add;
+  }
+
+  // Deduct from stock
+  stock.inf -= inf;
+  stock.cav -= cav;
+  stock.arc -= arc;
+
+  return { inf, cav, arc };
+}
+
+  function buildJoinManually(stock, marchCount, cap, fractions) {
+    const packs = [];
+
+    for (let m = 0; m < marchCount; m++) {
+        let i = Math.round(fractions.fin * cap);
+        let c = Math.round(fractions.fcav * cap);
+        let a = Math.round(fractions.farc * cap);
+
+        i = Math.min(i, stock.inf);
+        c = Math.min(c, stock.cav);
+        a = Math.min(a, stock.arc);
+
+        stock.inf -= i;
+        stock.cav -= c;
+        stock.arc -= a;
+
+        packs.push({ inf: i, cav: c, arc: a });
+    }
+
+    return { packs, leftover: stock };
+}
+
+  // ---------- Round Robin ----------
+  function fillRoundRobin(total, caps) {
+    const n = caps.length;
+    const out = Array(n).fill(0);
+    let t = Math.max(0, Math.floor(total));
+    let progress = true;
+    while (t > 0 && progress) {
+      progress = false;
+      for (let i=0; i<n && t>0; i++) {
+        if (out[i] < caps[i]) { out[i] += 1; t -= 1; progress = true; }
+      }
+    }
+    return out;
+  }
+
+  // ---------- Option‑A March Builder (arc → cav → fill to cap → inf last) ----------
+  function buildOptionAFormations(stock, formations, cap) {
+    const n = Math.max(1, formations);
+    // JOIN minimums: arc-first strategy, inf ≥ 1%, cav ≥ 3% (lower than CALL)
+    const JOIN_INF_MIN = 0.01;
+    const JOIN_CAV_MIN = 0.03;
+    const infMinPer = Math.ceil(JOIN_INF_MIN * cap);
+    const infMaxPer = Math.floor(INF_MAX_PCT * cap);
+    const cavMinPer = Math.ceil(JOIN_CAV_MIN * cap);
+
+    const infAlloc = Array(n).fill(0);
+    const cavAlloc = Array(n).fill(0);
+    const arcAlloc = Array(n).fill(0);
+
+    // Step 1: Allocate MINIMUM infantry to every march first.
+    const infMinCaps = Array(n).fill(infMinPer);
+    const infMinGive = fillRoundRobin(Math.min(stock.inf, infMinPer * n), infMinCaps);
+    for (let i=0; i<n; i++) { infAlloc[i] = infMinGive[i]; stock.inf -= infMinGive[i]; }
+
+    // Step 2: Allocate MINIMUM cavalry to every march.
+    const cavMinCaps = Array(n).fill(cavMinPer);
+    const cavMinGive = fillRoundRobin(Math.min(stock.cav, cavMinPer * n), cavMinCaps);
+    for (let i=0; i<n; i++) { cavAlloc[i] = cavMinGive[i]; stock.cav -= cavMinGive[i]; }
+
+    // Step 3: Fill ALL remaining space with archers (maximise archer placement).
+    const arcCaps = Array(n).fill(0).map((_,i) => Math.max(0, cap - infAlloc[i] - cavAlloc[i]));
+    const arcGive = fillRoundRobin(stock.arc, arcCaps);
+    for (let i=0; i<n; i++) { arcAlloc[i] = arcGive[i]; stock.arc -= arcGive[i]; }
+
+    // Step 4: If archers ran out before filling cap, top up with extra cavalry.
+    for (let i=0; i<n; i++) {
+      const space = cap - infAlloc[i] - cavAlloc[i] - arcAlloc[i];
+      if (space > 0 && stock.cav > 0) {
+        const add = Math.min(space, stock.cav);
+        cavAlloc[i] += add;
+        stock.cav -= add;
+      }
+    }
+
+    // Step 5: If still space (cav exhausted too), top up with extra infantry (up to infMax).
+    for (let i=0; i<n; i++) {
+      const space = cap - infAlloc[i] - cavAlloc[i] - arcAlloc[i];
+      if (space > 0 && stock.inf > 0) {
+        const maxExtraInf = Math.max(0, infMaxPer - infAlloc[i]);
+        const add = Math.min(space, stock.inf, maxExtraInf);
+        infAlloc[i] += add;
+        stock.inf -= add;
+      }
+    }
+
+    const packs = [];
+    for (let i=0; i<n; i++) {
+      packs.push({ inf: infAlloc[i], cav: cavAlloc[i], arc: arcAlloc[i] });
+    }
+    return { packs, leftover: { inf: stock.inf, cav: stock.cav, arc: stock.arc } };
+  }
+
+  // ---------- Recommended marches ----------
+  function meetsTargetFill(fill) { return fill >= 0.822; }
+  function computeRecommendationScore(fullCount, minFill, avgFill, leftover) {
+    const totalLeft = leftover.inf + leftover.cav + leftover.arc;
+    const cavPenalty = leftover.cav * 3;
+    return ( fullCount * 1e9 + (minFill * 0.822) * 1e6 + avgFill * 1e3 - (totalLeft + cavPenalty) );
+  }
+  function simulateMarchCount(marchCount, fractions, rallySize, joinCap, stockOriginal) {
+    const stockAfterRally = { ...stockOriginal };
+    const rally = buildRally(fractions, rallySize, stockAfterRally);
+    const result = buildOptionAFormations({ ...stockAfterRally }, marchCount, joinCap);
+    const { packs, leftover } = result;
+    const totals = packs.map(p => p.inf + p.cav + p.arc);
+    const fills = totals.map(t => t / joinCap);
+    const minFill = totals.length ? Math.min(...fills) : 0;
+    const avgFill = totals.length ? fills.reduce((a,b)=>a+b, 0) / fills.length : 0;
+    const fullCount = fills.filter(f => meetsTargetFill(f)).length;
+    return { marchCount, minFill, avgFill, fullCount, leftover,
+      score: computeRecommendationScore(fullCount, minFill, avgFill, leftover) };
+  }
+  function computeRecommendedMarches(maxMarches, fractions, rallySize, joinCap, stock) {
     const results = [];
-    for (const triplet of generateTriplets(bounds, stepPct)){
-      const res = simulateTriplet(tierKey, cloneStock(stock0), rallySize, X, joinCap, triplet);
-      results.push({ triplet, ...res });
-    }
-    results.sort((a,b) => b.totalScore - a.totalScore);
-    return results.slice(0, 10);
+    for (let n=1; n<=maxMarches; n++) { results.push(simulateMarchCount(n, fractions, rallySize, joinCap, stock)); }
+    results.sort((a,b)=>b.score - a.score);
+    return results[0];
   }
 
-  // 1:1 simple builder
-  function buildCallRally(mode, stock, rallySize, tierKey, manual){
-    const s = cloneStock(stock);
-    if(rallySize <= 0) return {rally:{inf:0, cav:0, arc:0}, stockAfter:s};
-    const w = manual ? {inf:manual.i, cav:manual.c, arc:manual.a} : {inf:1, cav:1, arc:1};
-    const W = Math.max(1e-9, w.inf + w.cav + w.arc);
-    const t = rallySize;
-    let idealInf = Math.round((w.inf / W) * t);
-    let idealCav = Math.round((w.cav / W) * t);
-    const r = { inf: Math.min(s.inf, idealInf), cav: Math.min(s.cav, idealCav), arc: 0 };
-    const remaining = t - (r.inf + r.cav);
-    r.arc = Math.min(s.arc, remaining);
-    s.inf -= r.inf; s.cav -= r.cav; s.arc -= r.arc;
-    return { rally:r, stockAfter:s };
-  }
-  function buildJoinRallies(mode, stockIn, X, cap, tierKey, manualTriplet=null){
-    const s = cloneStock(stockIn);
-    const w = manualTriplet ? {inf:manualTriplet.i, cav:manualTriplet.c, arc:manualTriplet.a} : {inf:1, cav:1, arc:1};
-    const W = Math.max(1e-9, w.inf + w.cav + w.arc);
-    const packs = [];
-    for (let i=0; i<X; i++){
-      const tInf = Math.round((w.inf / W) * cap);
-      const tCav = Math.round((w.cav / W) * cap);
-      const p = { inf: Math.min(s.inf, tInf), cav: Math.min(s.cav, tCav), arc: 0 };
-      const rem = cap - (p.inf + p.cav);
-      p.arc = Math.min(s.arc, rem);
-      s.inf -= p.inf; s.cav -= p.cav; s.arc -= p.arc;
-      packs.push(p);
-    }
-    return { packs, leftover: s };
-  }
+  function updateRecommendedDisplay() {
+    const recommendedEl = document.getElementById("opt_recommendedDisplay");
+    if (!recommendedEl) return;
 
-  // ------------------- Compute flow -------------------
-  function compute(mode){
-    const tierKey = $("troopTier").value;
-    const tier = TIERS?.tiers?.[tierKey];
-    $("selectedTierNote").textContent = tier
-      ? `Using tier ${tierKey} — Base ATK ${tier.inf[0]}/${tier.cav[0]}/${tier.arc[0]}`
-      : "";
-
-    const stock0 = {
-      inf: nval("stockInf"),
-      cav: nval("stockCav"),
-      arc: nval("stockArc")
+    const fractions = getFractionsForRally();
+    const rallySize = Math.max(0, Math.floor(num("rallySize")));
+    const joinCap = Math.max(1, Math.floor(num("marchSize")));
+    const maxMarches = Math.max(1, Math.floor(num("numFormations")));
+    const stock = {
+      inf: Math.max(0, Math.floor(num("stockInf"))),
+      cav: Math.max(0, Math.floor(num("stockCav"))),
+      arc: Math.max(0, Math.floor(num("stockArc")))
     };
-    const rallySize = nval("rallySize");
-    const joinCap = nval("marchSize");
-    const X = nval("numFormations");
-    const parsed = parseTriplet($("compInput").value);
-    const manual = parsed ? parsed : null;
 
-    let rally, joins, leftover, fractions;
+    const best = computeRecommendedMarches(maxMarches, fractions, rallySize, joinCap, stock);
+    const oldValue = window.__recommendedMarches;
+    const newValue = best.marchCount;
 
-    if (mode === "magic12") {
-      const top10 = findTopSetups(tierKey, stock0, rallySize, X, joinCap, { stepPct: 1 });
-      let rallyBest, joinsBest, leftoverBest;
-      if (top10 && top10.length) {
-        const best = top10[0];
-        rallyBest = best.call; joinsBest = best.joins; leftoverBest = best.leftover;
-        adjustCallRallyCapsAndBias(rallyBest, leftoverBest, rallySize, {
-          maxInfPct: 0.20, maxCavPct: 0.30, arcBiasPct: 0.03
-        });
-        applyPriorityPostFix(rallyBest, joinsBest, leftoverBest, rallySize, joinCap);
-        renderFinalScoreboard(rallyBest, joinsBest, tierKey);
-      } else {
-        const plan = planMagicAlloc("magic12", stock0, rallySize, X, joinCap, tierKey);
-        rallyBest = plan.rally; joinsBest = plan.packs; leftoverBest = plan.leftover;
-        adjustCallRallyCapsAndBias(rallyBest, leftoverBest, rallySize, { maxInfPct: 0.20, maxCavPct: 0.30, arcBiasPct: 0.03 });
-        applyPriorityPostFix(rallyBest, joinsBest, leftoverBest, rallySize, joinCap);
-        renderFinalScoreboard(rallyBest, joinsBest, tierKey);
-      }
-      rally = rallyBest; joins = joinsBest; leftover = leftoverBest;
-      const tCall = Math.max(1, sumTroops(rally));
-      fractions = { i:rally.inf/tCall, c:rally.cav/tCall, a:rally.arc/tCall };
-
-    } else {
-      // ratio11 mode
-      let stats = {
-        inf_atk:nval("inf_atk"), inf_let:nval("inf_let"),
-        cav_atk:nval("cav_atk"), cav_let:nval("cav_let"),
-        arc_atk:nval("arc_atk"), arc_let:nval("arc_let")
-      };
-      for (const k of ["inf_atk","inf_let","cav_atk","cav_let","arc_atk","arc_let"]) {
-        if (!Number.isFinite(stats[k]) || stats[k] <= 0) stats[k] = 1;
-      }
-      let opt = computeExactOptimalFractions(stats, tierKey);
-      opt = enforceBounds(opt);
-      if (!isFinite(opt.fi) || !isFinite(opt.fc) || !isFinite(opt.fa)) opt = { fi:0.08, fc:0.12, fa:0.80 };
-      const frac = { i: opt.fi, c: opt.fc, a: opt.fa };
-      const useFrac = manual ? manual : frac;
-      const cr = buildCallRally("ratio11", stock0, rallySize, tierKey, useFrac);
-      const jr = buildJoinRallies("ratio11", cr.stockAfter, X, joinCap, tierKey, useFrac);
-      rally = cr.rally; joins = jr.packs; leftover = jr.leftover;
-      const tCall2 = Math.max(1, sumTroops(rally));
-      fractions = { i:rally.inf/tCall2, c:rally.cav/tCall2, a:rally.arc/tCall2 };
-      renderFinalScoreboard(rally, joins, tierKey);
-    }
-
-    // ── NEW RECOMMENDATION: use actual rally + fractions ──
-    // Stock after call = stock0 minus what the call rally consumed
-    const stockAfterCall = {
-      inf: Math.max(0, (stock0.inf|0) - (rally.inf|0)),
-      cav: Math.max(0, (stock0.cav|0) - (rally.cav|0)),
-      arc: Math.max(0, (stock0.arc|0) - (rally.arc|0))
-    };
-    const recResult = recommendMarchCount(rally, stockAfterCall, fractions, X, joinCap);
-    const recN = recResult.bestN;
-
-    window.__recommendedMarches = recN > 0 ? recN : X;
-
-    if (recN > 0) {
-      $("recommendedDisplay").textContent =
-        `Best: ${recN} march${recN > 1 ? 'es' : ''} — all pass ≥85% fill + troop quality gates`;
-    } else {
-      // No N passed — show why first march failed as a hint
-      const firstDetail = recResult.details[0];
-      const failReason = firstDetail?.packs?.[0]?.failures?.join(', ') || 'insufficient troops';
-      $("recommendedDisplay").textContent =
-        `No marches pass quality gates (${failReason}) — showing ${X} as entered`;
-    }
-
-    // Display
-    renderCallTable(rally);
-    renderJoinTable(joins);
-    $("fractionReadout").textContent = `Using: ${toPctTriplet(fractions)} (Inf/Cav/Arc)`;
-    const formed = joins.reduce((s,p)=>s+sumTroops(p),0);
-    const before = sumTroops(stock0);
-    const used = sumTroops(rally) + formed;
-    $("inventoryReadout").textContent =
-      `Rally ${sumTroops(rally)} used → INF ${rally.inf}, CAV ${rally.cav}, ARC ${rally.arc}.
-Formations built: ${joins.length} × ${joinCap} → ${formed} troops.
-Leftover → INF ${leftover.inf}, CAV ${leftover.cav}, ARC ${leftover.arc}.
-Stock used: ${used} / ${before}.`;
-
-    $("hiddenLastMode").value = mode;
-    $("hiddenBestFractions").value = toPctTriplet(fractions);
+    recommendedEl.textContent = `Best: ${newValue} marches (min fill ${(best.minFill*100).toFixed(1)}%)`;
+    window.__recommendedMarches = newValue;
   }
 
-  // ------------------- Public API -------------------
-  async function init(){
-    if (inited) return;
-    if (!TIERS){
-      try {
-        const res = await fetch("tiers.json", {cache:"no-store"});
-        TIERS = await res.json();
-      } catch(e){
-        console.error("tiers.json failed", e);
-        if (location.protocol === "file:") {
-          alert("Running from file:// blocks fetch of tiers.json.\nStart a local server or use Netlify.\nUsing a minimal inline fallback for testing.");
-          TIERS = {
-            tiers: {
-              "T6":      { "inf": [243, 730],  "cav": [730, 243],  "arc": [974,183] },
-              "T9":      { "inf": [400,1200], "cav": [1200,400], "arc": [1600,300] },
-              "T10":     { "inf": [472,1416], "cav": [1416,470], "arc": [1888,354] },
-              "T10.TG1": { "inf": [491,1473], "cav": [1473,491], "arc": [1964,368] },
-              "T10.TG2": { "inf": [515,1546], "cav": [1546,515], "arc": [2062,387] },
-              "T10.TG3": { "inf": [541,1624], "cav": [1624,541], "arc": [2165,402] },
-              "T10.TG4": { "inf": [568,1705], "cav": [1705,568], "arc": [2273,426] },
-              "T10.TG5": { "inf": [597,1790], "cav": [1790,597], "arc": [2387,448] }
-            }
-          };
+  // ---------- Optimizer handler ----------
+  function onOptimize() {
+    const stats = {
+      inf_atk: num("inf_atk"), inf_let: num("inf_let"),
+      cav_atk: num("cav_atk"), cav_let: num("cav_let"),
+      arc_atk: num("arc_atk"), arc_let: num("arc_let")
+    };
+    const tierRaw = document.getElementById("troopTier").value;
+
+    const opt = computeExactOptimalFractions(stats, tierRaw);
+    const bounded = enforceCompositionBounds(opt.fin,opt.fcav,opt.farc);
+    lastBestTriplet = { fin: bounded.fin, fcav: bounded.fcav, farc: bounded.farc };
+
+    const usedFractions = getFractionsForRally();
+    const usedDisp = formatTriplet(usedFractions.fin,usedFractions.fcav,usedFractions.farc);
+    const bestDisp = formatTriplet(bounded.fin,bounded.fcav,bounded.farc);
+
+    const fracEl = document.getElementById("opt_fractionReadout");
+    if (fracEl) fracEl.innerText = `Target fractions (bounded · Inf 7.5–10%, Cav ≥ 10%): ${usedDisp} · Best: ${bestDisp}`;
+
+    const stock = {
+      inf: Math.max(0, Math.floor(num("stockInf"))),
+      cav: Math.max(0, Math.floor(num("stockCav"))),
+      arc: Math.max(0, Math.floor(num("stockArc")))
+    };
+    const cap = Math.max(1, Math.floor(num("marchSize")));
+    // Use recommended march count if in recommended mode, else user's input
+    const formations = (window.__optARecommendedMode && window.__recommendedMarches)
+      ? window.__recommendedMarches
+      : Math.max(1, Math.floor(num("numFormations")));
+    const rallySize = Math.max(0, Math.floor(num("rallySize")));
+
+    const totalAvailBefore = stock.inf + stock.cav + stock.arc;
+    const rally = buildRally(usedFractions, rallySize, stock);
+    const rallyTotal = rally.inf + rally.cav + rally.arc;
+
+    let joinFractionsManual = getJoinFractionsManual();
+
+    let result;
+    if (joinFractionsManual) {
+        // manual override for JOIN marches
+        result = buildJoinManually({ ...stock }, formations, cap, joinFractionsManual);
+    } else {
+        // existing arc-first engine logic
+        result = buildOptionAFormations({ ...stock }, formations, cap);
+    }
+
+    const { packs, leftover } = result;
+
+    // table
+    let html = `<table><thead>
+      <tr><th>Type</th><th>Infantry</th><th>Calvary</th><th>Archer</th><th>Total</th></tr>
+    </thead><tbody>`;
+    if (rallySize > 0) {
+      html += `<tr style="background:#162031;">
+        <td><strong>CALL</strong></td>
+        <td>${rally.inf}</td>
+        <td>${rally.cav}</td>
+        <td>${rally.arc}</td>
+        <td>${rallyTotal}</td>
+      </tr>`;
+    }
+    packs.forEach((p, idx) => {
+      const tot = p.inf + p.cav + p.arc;
+      html += `<tr><td>#${idx+1}</td>
+        <td>${p.inf}</td>
+        <td>${p.cav}</td>
+        <td>${p.arc}</td>
+        <td>${tot}</td></tr>`;
+    });
+    html += `</tbody></table>`;
+    const tableEl = document.getElementById("optTableWrap");
+    if (tableEl) tableEl.innerHTML = html;
+
+    // inventory readout
+    const formedTroops = packs.reduce((s,p)=>s+p.inf+p.cav+p.arc, 0);
+    const totalUsed = (totalAvailBefore - (leftover.inf+leftover.cav+leftover.arc));
+    const msgParts = [];
+    if (rallySize > 0) {
+      msgParts.push(
+        `Rally used → INF ${rally.inf.toLocaleString()}, ` +
+        `CAV ${rally.cav.toLocaleString()}, ` +
+        `ARC ${rally.arc.toLocaleString()} ` +
+        `(total ${rallyTotal.toLocaleString()}).`
+      );
+    } else {
+      msgParts.push(`Rally not built (set "Call rally size" to consume troops first).`);
+    }
+    msgParts.push(
+      `Formations built: ${packs.length} × cap ${cap.toLocaleString()} ` +
+      `(troops placed: ${formedTroops.toLocaleString()}).`
+    );
+    msgParts.push(
+      `Leftover → INF ${leftover.inf.toLocaleString()}, ` +
+      `CAV ${leftover.cav.toLocaleString()}, ARC ${leftover.arc.toLocaleString()}.`
+    );
+    msgParts.push(
+      `Stock used: ${totalUsed.toLocaleString()} of ${totalAvailBefore.toLocaleString()}.`
+    );
+    const invEl = document.getElementById("opt_inventoryReadout");
+    if (invEl) { invEl.style.whiteSpace = "pre-line"; invEl.innerText = msgParts.join("\n\n"); }
+
+    updateRecommendedDisplay();
+
+    // ── COMPOSITION READBACK ENGINE ──
+    // This is the LAST step in the chain.
+    // Reads actual built formations → writes 1-decimal % back to comp fields
+    // (only when user has not manually edited those fields).
+    readbackCompositionFields(rally, packs);
+  }
+
+  // ---------- Public API ----------
+  function wireListeners(){
+    // Plot button
+    const btnPlot = document.getElementById("btnPlot");
+    if (btnPlot) btnPlot.addEventListener("click", () => {
+      window.__optARecommendedMode = false;
+      const btn = document.getElementById("opt_btnUseRecommended");
+      if (btn) { btn.textContent = "🔥Recommended"; btn.style.background = ""; }
+      computePlots(); onOptimize();
+    });
+
+    // Optimize button
+    const btnOpt = document.getElementById("btnOptimize");
+    if (btnOpt) btnOpt.addEventListener("click", () => {
+      window.__optARecommendedMode = false;
+      const btn = document.getElementById("opt_btnUseRecommended");
+      if (btn) { btn.textContent = "🔥Recommended"; btn.style.background = ""; }
+      onOptimize();
+    });
+
+    // Composition field – Call
+    const compEl = getCompEl();
+    if (compEl) {
+      compEl.addEventListener("input", () => {
+        if (_readbackWriting) return; // ignore programmatic writes from readback engine
+        if (compEl.value.trim() === '') {
+          compUserEdited = false;
         } else {
-          TIERS = { tiers:{} };
+          compUserEdited = true;
         }
-      }
+        onOptimize();
+      });
     }
 
-    $("btnMagic12")?.addEventListener("click", () => compute("magic12"));
-    $("btnRecompute")?.addEventListener("click", () => {
-      const mode = $("hiddenLastMode")?.value || "magic12";
-      compute(mode);
-    });
-    // ── Recommended / Reset toggle ──
-    // State: null = showing original, number = currently showing recommended
-    let _originalMarches = null;
-
-    function updateRecButton() {
-      const btn = $("btnUseRecommended");
-      if (!btn) return;
-      if (_originalMarches !== null) {
-        btn.textContent = "↩ Reset to Original";
-        btn.style.background = "#6b7280";
-      } else {
-        btn.textContent = "✅ Use Recommended";
-        btn.style.background = "";
-        btn.className = "btn btn-ok";
-      }
+    // Composition field – Join
+    const compJoinEl = document.getElementById("compInputJoin");
+    if (compJoinEl) {
+      compJoinEl.addEventListener("input", () => {
+        if (_readbackWriting) return; // ignore programmatic writes from readback engine
+        if (compJoinEl.value.trim() === '') {
+          compJoinUserEdited = false;
+        } else {
+          compJoinUserEdited = true;
+        }
+        onOptimize();
+      });
     }
 
-    $("btnUseRecommended")?.addEventListener("click", () => {
-      const mode = $("hiddenLastMode")?.value || "magic12";
-      if (_originalMarches !== null) {
-        // Currently showing recommended → reset to original
-        $("numFormations").value = _originalMarches;
-        _originalMarches = null;
-        updateRecButton();
-        Promise.resolve().then(() => compute(mode));
-      } else {
-        // Currently showing original → apply recommended
-        if (window.__recommendedMarches) {
-          _originalMarches = $("numFormations").value;
-          $("numFormations").value = window.__recommendedMarches;
-          updateRecButton();
-          Promise.resolve().then(() => compute(mode));
+    // Use Best
+    const btnBest = document.getElementById("opt_btnUseBest");
+    if (btnBest) btnBest.addEventListener("click", () => {
+      compUserEdited = false;
+      setCompInputFromBest();
+      onOptimize();
+    });
+
+  // Use Recommended (Option-A engine)
+    const btnUseRecommended = document.getElementById("opt_btnUseRecommended");
+    if (btnUseRecommended) {
+      btnUseRecommended.addEventListener("click", () => {
+        if (!window.__optARecommendedMode) {
+          // Switch to recommended mode
+          if (window.__recommendedMarches) {
+            window.__optARecommendedMode = true;
+            window.__optAUserMarchCount = document.getElementById("numFormations").value;
+            btnUseRecommended.textContent = "✏️ Manual";
+            btnUseRecommended.style.background = "#157347";
+            // Run with recommended march count but keep user's input field unchanged
+            const savedVal = document.getElementById("numFormations").value;
+            document.getElementById("numFormations").value = window.__recommendedMarches;
+            onOptimize();
+            document.getElementById("numFormations").value = savedVal;
+          }
+        } else {
+          // Switch back to manual mode
+          window.__optARecommendedMode = false;
+          btnUseRecommended.textContent = "🔥Recommended";
+          btnUseRecommended.style.background = "";
+          onOptimize();
         }
-      }
-    });
+      });
+    }
+  }
 
-    // Reset toggle state whenever user manually changes the # of marches field
-    $("numFormations")?.addEventListener("input", () => {
-      if (_originalMarches !== null) {
-        _originalMarches = null;
-        updateRecButton();
-      }
-    });
+  function computeAll(){
+    // Validate inputs before computing
+    if(window.Magic && window.Magic.validateInputs && !window.Magic.validateInputs()){
+      console.warn("Validation failed in Option-A, aborting compute");
+      return;
+    }
+    
+    computePlots();
+    onOptimize();
+    updateRecommendedDisplay();
+  }
 
-    $("compInput")?.addEventListener("input", () => {
-      const p = parseTriplet($("compInput").value);
-      $("compHint").textContent = p ? `Manual override: ${toPctTriplet(p)}` : `Invalid or empty → auto fractions`;
-    });
-
+  function init(){
+    if (inited) return;
+    wireListeners();
+    // Auto-compute on show (Option‑A)
+    computeAll();
     inited = true;
-    compute("magic12");
   }
 
   // Expose
-  window.Magic = { init, compute, validateInputs: () => true };
+  window.OptionA = { init, computeAll };
+
 
 })();
