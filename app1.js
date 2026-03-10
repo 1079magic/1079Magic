@@ -448,19 +448,23 @@
 
   // ── NEW: update the recommended display text and button state ──
   function updateRecommendedDisplay(recN, X) {
-    const btn = $("btnUseRecommended");
     if (recN > 0) {
       window.__recommendedMarches = recN;
       $("recommendedDisplay").textContent =
         `Best: ${recN} march${recN > 1 ? 'es' : ''} — all pass ≥85% fill + troop quality gates`;
-      if (btn) { btn.disabled = false; btn.title = `Apply ${recN} march${recN>1?'es':''}` };
     } else {
       window.__recommendedMarches = X;
       $("recommendedDisplay").textContent = `No marches pass quality gates — showing ${X} as entered`;
-      if (btn) { btn.disabled = true; btn.title = ''; }
     }
-    // Reset button to default state whenever compute runs
+    // NOTE: button state is managed exclusively by the button click handler.
+    // Do NOT touch _originalMarches or button text/style here.
+  }
+
+  // Called only when user triggers a fresh compute via Magic Ratio / Recompute buttons
+  // (not when the Recommended button triggers compute). Resets toggle state.
+  function resetRecButtonState() {
     _originalMarches = null;
+    const btn = $("btnUseRecommended");
     if (btn) {
       btn.textContent = "🔥 Recommended";
       btn.style.background = "";
@@ -960,8 +964,9 @@ Stock used: ${used} / ${before}.`;
       }
     }
 
-    $("btnMagic12")?.addEventListener("click", () => compute("magic12"));
+    $("btnMagic12")?.addEventListener("click", () => { resetRecButtonState(); compute("magic12"); });
     $("btnRecompute")?.addEventListener("click", () => {
+      resetRecButtonState();
       const mode = $("hiddenLastMode")?.value || "magic12";
       compute(mode);
     });
