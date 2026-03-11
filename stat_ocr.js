@@ -1,5 +1,5 @@
 /* ============================================================
- Stat Screenshot OCR  v7 — fully local, zero external APIs
+ Stat Screenshot OCR  v8 — fully local, zero external APIs
 
  Uses Tesseract.js (WebAssembly, runs entirely in browser).
  No API keys. No server. No network calls beyond loading
@@ -8,28 +8,31 @@
  TWO MODES:
  ─────────────────────────────────────────────────────────────
  1) STATS  (Bonus Details / Mail screenshot)
-    • Full-image PSM-6 OCR — works on ALL screenshot formats
-      (original red-column format AND newer unified-row format)
-    • Each line matched by keyword: "Infantry Attack", "Cavalry Lethality", etc.
-    • First +NNN.N% on matching line → stat value
-    • No red-pixel band detection needed — 100% reliable across formats
+    • OCR restricted to LEFT 72% of image only
+      → FIXES: was previously picking up right-column green +660%
+        values. Layout is [RED left%] [Stat Name center] [GREEN right%]
+        Cropping to 72% captures red values + stat names, excludes green.
+    • PSM-6 full pass on cropped region
+    • Each line matched by keyword: "Infantry Attack", etc.
+    • First +NNN.N% on matching line → stat value (the red left value)
 
  2) TROOPS  (Troops Preview screenshot)
-    • Locates inner cream/white panel via brightness scan
-    • THREE separate OCR passes per column (left 3-52%, right 48-97%):
-        PSM 4, PSM 6, PSM 11 — 3× scaled B&W canvas each
-    • For each troop type, take the HIGHEST count from any pass (merge-best)
-    • Smart parser:
-        – Type detection: \binfantr / \bcavalr / \barcher (word-boundary)
-          prevents "March" → false arc detection
-        – Number extraction: handles comma/period/space separators,
-          slash OCR artifacts (2/4033 → 274033 via suffix),
-          7-digit garble (6359717 → 359717 last-6-digits trick)
-        – Up to 3-line lookahead for counts separated by icon garbage
-        – Accumulates across all tier variants (Elite+Brave+Veteran)
-    • Tier select based on ARCHER's tier + TG badge level:
-        T1–7 → T6, T8–9 → T9, T10 → T10, T10+TG → T10.TGn
-    • TG badge detection via gold-pixel cluster flood fill + digit OCR
+    • COMPLETELY REWRITTEN — single full-panel OCR instead of
+      unreliable left/right column splitting
+    • Single PSM-6 pass on full cream panel area
+    • Parser scans line by line:
+        – Detects troop name line (Infantry/Cavalry/Archer keyword)
+        – Extracts tier from troop name prefix (Elite=T8, Apex=T10, etc.)
+        – Reads count from same line or next line
+        – ACCUMULATES all tiers per type (Elite+Brave+Veteran all sum up)
+    • TG level detection — FIXED based on actual game UI:
+        The TG badge is a small GOLD CIRCLE in the TOP-LEFT corner
+        of the hexagon icon, containing an Arabic digit (1, 2, 3, 4, 5).
+        The Roman numeral badge at the BOTTOM of the hex is the TROOP
+        TIER (I=T1 ... X=T10), NOT the TG level.
+        Detection: scan for gold circular clusters in top-left quadrant
+        of each troop icon region, OCR the Arabic digit inside.
+    • Tier select: based on highest archer base tier + TG level
  ─────────────────────────────────────────────────────────────
 ============================================================ */
 
@@ -66,25 +69,33 @@
   }
 
   /**
-   * Returns a drawn canvas for a fractional region of img.
+   * Draw a fractional region of img onto a new canvas.
    * x0f/y0f/x1f/y1f are 0–1 fractions of natural width/height.
    */
-  function getPixels(img, x0f, y0f, x1f, y1f) {
+  function getRegionCanvas(img, x0f, y0f, x1f, y1f) {
     const W = img.naturalWidth, H = img.naturalHeight;
     const x0 = Math.round(x0f * W), y0 = Math.round(y0f * H);
     const cw = Math.max(1, Math.round(x1f * W) - x0);
     const ch = Math.max(1, Math.round(y1f * H) - y0);
     const c = document.createElement('canvas');
     c.width = cw; c.height = ch;
-    const ctx = c.getContext('2d');
-    ctx.drawImage(img, x0, y0, cw, ch, 0, 0, cw, ch);
-    return { ctx, canvas: c, w: cw, h: ch };
+    c.getContext('2d').drawImage(img, x0, y0, cw, ch, 0, 0, cw, ch);
+    return c;
   }
 
   /**
-   * Build a black-on-white B&W canvas.
-   * isDark(r,g,b) → true = render as black pixel.
-   * scale: integer upscale factor (default 3).
+   * Get raw pixel data for a fractional region.
+   */
+  function getPixels(img, x0f, y0f, x1f, y1f) {
+    const c = getRegionCanvas(img, x0f, y0f, x1f, y1f);
+    const ctx = c.getContext('2d');
+    return { ctx, canvas: c, w: c.width, h: c.height };
+  }
+
+  /**
+   * Build a high-contrast black-on-white B&W canvas for OCR.
+   * isDark(r,g,b) → true = render as black (text) pixel.
+   * scale: integer upscale factor for better OCR accuracy (default 3).
    */
   function buildBWCanvas(img, x0f, y0f, x1f, y1f, isDark, scale) {
     scale = scale || 3;
@@ -106,7 +117,7 @@
 
   /**
    * OCR a canvas with a fresh Tesseract worker.
-   * psm: page-seg-mode (6 = uniform block, 7 = single line, 4/11 = column modes)
+   * psm: page-seg-mode (6=uniform block, 7=single line, 10=single char)
    * whitelist: char whitelist string or null.
    * Worker is terminated after use.
    */
@@ -122,21 +133,24 @@
   }
 
   // ══════════════════════════════════════════════════════════
-  // STATS ENGINE  (v7 – full-image keyword matching)
+  // STATS ENGINE  (v8 – LEFT 72% CROP to avoid green right column)
   // ══════════════════════════════════════════════════════════
   //
-  // Single PSM-6 OCR of the entire image. Each stat row comes out as:
-  //   "+511.3%   Infantry Attack   +660.0%"
-  // We match by keyword and grab the first +NNN.N% value on that line.
-  // Works for ALL screenshot formats (red-column Mail AND no-red-column variants).
+  // The Bonus Details screen layout per row:
+  //   [RED +420.0%]   [Infantry Attack]   [GREEN +660.0%]
+  //    ~0-25%              ~25-70%              ~70-100%
+  //
+  // By cropping to x=0..0.72 we capture the red left values AND the
+  // stat name text, but exclude the green right column entirely.
+  // This prevents the engine from ever reading +660 as a stat value.
 
   const STAT_KEYWORDS = {
-    inf_atk: /infantry.{0,10}attack/i,
-    inf_let: /infantry.{0,10}lethality/i,
-    cav_atk: /cavalry.{0,10}attack/i,
-    cav_let: /cavalry.{0,10}lethality/i,
-    arc_atk: /archer.{0,10}attack/i,
-    arc_let: /archer.{0,10}lethality/i,
+    inf_atk: /infantry.{0,12}attack/i,
+    inf_let: /infantry.{0,12}lethality/i,
+    cav_atk: /cavalry.{0,12}attack/i,
+    cav_let: /cavalry.{0,12}lethality/i,
+    arc_atk: /archer.{0,12}attack/i,
+    arc_let: /archer.{0,12}lethality/i,
   };
 
   function parseStatsFromText(text) {
@@ -145,6 +159,7 @@
       for (const [key, re] of Object.entries(STAT_KEYWORDS)) {
         if (key in results) continue;
         if (!re.test(line)) continue;
+        // Grab first +NNN.N% pattern on this line — that's the red left value
         const m = line.match(/\+(\d{2,4})[.,](\d)/);
         if (m) results[key] = parseFloat(`${m[1]}.${m[2]}`);
       }
@@ -157,8 +172,8 @@
     const img = await fileToImage(file);
     setStatus('🔍 Reading stats…', '#a0b4d0');
 
-    // Full-image B&W (capture all dark text on light background), 2× scale
-    const bw = buildBWCanvas(img, 0, 0, 1, 1,
+    // Crop to left 72%: captures red values + center stat names, skips green right col
+    const bw = buildBWCanvas(img, 0, 0, 0.72, 1,
       (r, g, b) => r + g + b < 500,
       2
     );
@@ -167,26 +182,45 @@
   }
 
   // ══════════════════════════════════════════════════════════
-  // TROOPS ENGINE  (v7 – multi-PSM column split + merge-best)
+  // TROOPS ENGINE  (v8 – single-pass full OCR + correct TG detection)
   // ══════════════════════════════════════════════════════════
 
-  const TIER_MAP = {
-    recruit: 1, warrior: 2, fighter: 3, skirmisher: 3,
-    guardian: 5, sentinel: 6, veteran: 4, brave: 7,
-    elite: 8, champion: 9, hero: 9, supreme: 9,
-    apex: 10, legend: 10, legendary: 10,
+  // Troop name prefix → base tier number
+  // Used for tier select dropdown logic
+  const TROOP_PREFIX_TIER = {
+    // T1-T6 range → map to T6 in dropdown
+    'recruit':    1,
+    'warrior':    2,
+    'fighter':    3,
+    'skirmisher': 3,
+    'guardian':   5,
+    'sentinel':   6,
+    // T7
+    'brave':      7,
+    // T8
+    'elite':      8,
+    // T9
+    'veteran':    4,   // veteran is actually T4 in game naming
+    'champion':   9,
+    'hero':       9,
+    'supreme':    9,
+    // T10
+    'apex':      10,
+    'legend':    10,
+    'legendary': 10,
   };
+
+  // Sorted by tier descending so highest match wins
+  const SORTED_PREFIXES = Object.entries(TROOP_PREFIX_TIER)
+    .sort((a, b) => b[1] - a[1]);
 
   const TIER_SELECT_OPTIONS = ['T6','T9','T10','T10.TG1','T10.TG2','T10.TG3','T10.TG4','T10.TG5'];
 
-  /**
-   * Map archer's (baseTier, tgLevel) → troopTier select value.
-   * Archer is the primary focus of this app.
-   */
   function tierToSelectValue(baseTier, tgLevel) {
     if (baseTier >= 10) {
       if (tgLevel >= 1) {
-        const opt = 'T10.TG' + Math.min(tgLevel, 5);
+        const clamped = Math.min(tgLevel, 5);
+        const opt = 'T10.TG' + clamped;
         return TIER_SELECT_OPTIONS.includes(opt) ? opt : 'T10';
       }
       return 'T10';
@@ -196,275 +230,350 @@
   }
 
   /**
-   * Detect troop types in a line using word-boundary patterns.
-   * \binfantr / \bcavalr / \barcher prevents "March" → false arc hit.
-   * Returns types sorted by position (left-to-right).
+   * Get the base tier for a troop name line.
+   * Checks for known prefix words (apex, elite, supreme, etc.)
+   */
+  function getTierFromName(line) {
+    const l = line.toLowerCase();
+    for (const [prefix, tier] of SORTED_PREFIXES) {
+      if (l.includes(prefix)) return tier;
+    }
+    return 0;
+  }
+
+  /**
+   * Detect what troop TYPE(s) appear in a line.
+   * Uses word-boundary patterns to prevent false matches
+   * (e.g. "March" should not trigger "arc" for Archer).
+   * Returns array of matched types: 'inf', 'cav', 'arc'
    */
   function getTypesInLine(line) {
     const l = line.toLowerCase();
     const found = [];
-    const INF = l.search(/\binfantr/);
-    const CAV = l.search(/\bcavalr/);
-    const ARC = l.search(/\barcher/);
-    if (INF >= 0) found.push([INF, 'inf']);
-    if (CAV >= 0) found.push([CAV, 'cav']);
-    if (ARC >= 0) found.push([ARC, 'arc']);
+    // Word-boundary checks to avoid partial matches
+    if (/\binfantr/.test(l)) found.push([l.search(/\binfantr/), 'inf']);
+    if (/\bcavalr/.test(l)) found.push([l.search(/\bcavalr/), 'cav']);
+    if (/\barcher/.test(l)) found.push([l.search(/\barcher/), 'arc']);
+    // Sort by position (left to right)
     found.sort((a, b) => a[0] - b[0]);
     return found.map(([, tp]) => tp);
   }
 
   /**
-   * Extract troop counts from a text line.
-   * Handles:
-   *   270,127 / 270.127 / 270 127 / 270127   (clean formats)
-   *   2/4033   (slash OCR artifact for comma)  → 24033 → 4033 only, but
-   *            with suffix logic for 7-digit numbers it recovers the correct value
-   *   6359717  (7-digit OCR garble of 359,717) → last 6 digits: 359717
+   * Extract troop count numbers from a text line.
+   * Handles all common OCR number formats:
+   *   274,033  274.033  274 033  274033
+   *   Slash artifact: 2/4033 → 24033
+   *   7-digit garble: 6359717 → take last 6 digits (359717)
    */
   function extractNums(line) {
-    let s = line.replace(/(\d)\/(\d)/g, '$1$2');         // slash artifact
-    s = s.replace(/(\d)[.,](\d{3})(?=\D|$)/g, '$1$2');  // comma/period thousands
-    s = s.replace(/(\d{1,3}) (\d{3})(?=\D|$)/g, '$1$2'); // space thousands
+    // Fix slash OCR artifact (comma read as slash)
+    let s = line.replace(/(\d)\/(\d)/g, '$1$2');
+    // Normalize thousands separators: comma/period/space between digit groups
+    s = s.replace(/(\d)[.,](\d{3})(?!\d)/g, '$1$2');
+    s = s.replace(/(\d) (\d{3})(?!\d)/g, '$1$2');
 
     const result = [];
-    for (const tok of (s.match(/\b\d{3,}\b/g) || [])) {
+    const matches = s.match(/\b\d{3,}\b/g) || [];
+    for (const tok of matches) {
       const n = parseInt(tok, 10);
-      if (n <= 999999) {
-        result.push(n);
-      } else if (tok.length > 6) {
-        // 7+ digit OCR garble — take last 6 digits as the real count
+      if (tok.length > 6) {
+        // 7+ digit OCR garble — last 6 digits heuristic
         const suffix = parseInt(tok.slice(-6), 10);
         if (suffix >= 100) result.push(suffix);
+      } else if (n >= 100) {
+        result.push(n);
       }
     }
     return result;
   }
 
-  function getTierFromLine(line) {
-    const l = line.toLowerCase();
-    let best = 0;
-    for (const [name, tier] of Object.entries(TIER_MAP)) {
-      if (l.includes(name) && tier > best) best = tier;
-    }
-    return best;
-  }
-
   /**
-   * Parse one column's OCR text into { totals, bestTier }.
-   * Looks ahead up to 3 lines past a type-word line for the count numbers
-   * (needed when icon garbage lines split them).
+   * Find the content panel bounds (the cream/white troop list area).
+   * Scans rows for brightness to locate the main light panel.
+   * Returns [yTopFraction, yBottomFraction] of the panel.
    */
-  function parseColumnText(text) {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const totals   = { inf: 0, cav: 0, arc: 0 };
-    const bestTier = { inf: 0, cav: 0, arc: 0 };
-
-    let i = 0;
-    while (i < lines.length) {
-      const line  = lines[i];
-      const types = getTypesInLine(line);
-
-      if (types.length === 0) { i++; continue; }
-
-      const tier = getTierFromLine(line);
-      let nums = extractNums(line);
-
-      // Lookahead: find numbers on following lines (up to 3), stop at next type-word line
-      let look = 0;
-      while (nums.length < types.length && look < 3 && i + 1 + look < lines.length) {
-        const next = lines[i + 1 + look];
-        if (getTypesInLine(next).length > 0) break;
-        const nn = extractNums(next);
-        if (nn.length > 0) {
-          nums = nums.concat(nn);
-          look++;
-          if (nums.length >= types.length) break;
-        } else {
-          look++;  // blank/garbage line — skip but keep looking
-        }
-      }
-
-      i += 1 + look;
-
-      // Assign counts to types left-to-right
-      for (let j = 0; j < types.length; j++) {
-        const tp = types[j];
-        if (j < nums.length && nums[j] >= 1) {
-          totals[tp]   += nums[j];
-          if (tier > bestTier[tp]) bestTier[tp] = tier;
-        }
-      }
-    }
-
-    return { totals, bestTier };
-  }
-
-  /**
-   * Merge multiple parse results: for each troop type, keep the highest count.
-   * OCR errors almost always under-count, so max = best estimate.
-   */
-  function mergeBest(results) {
-    const totals   = { inf: 0, cav: 0, arc: 0 };
-    const bestTier = { inf: 0, cav: 0, arc: 0 };
-    for (const r of results) {
-      for (const tp of ['inf', 'cav', 'arc']) {
-        if (r.totals[tp]   > totals[tp])   totals[tp]   = r.totals[tp];
-        if (r.bestTier[tp] > bestTier[tp]) bestTier[tp] = r.bestTier[tp];
-      }
-    }
-    return { totals, bestTier };
-  }
-
-  // ── TG badge detection ────────────────────────────────────
-  /**
-   * Flood-fill scan for gold circular badge clusters.
-   * Returns array of { cx, cy, w, h } for each small gold cluster.
-   */
-  function detectTGBadgeCandidates(img) {
-    const { ctx, w, h } = getPixels(img, 0, 0, 1, 1);
-    const d = ctx.getImageData(0, 0, w, h).data;
-    const visited = new Uint8Array(w * h);
-    const candidates = [];
-
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = (y * w + x) * 4;
-        const r = d[i], g = d[i+1], b = d[i+2];
-        if (visited[y*w+x] || !(r>180 && g>120 && b<120 && r-b>80)) continue;
-
-        const queue = [[x, y]];
-        visited[y*w+x] = 1;
-        let cnt = 0, mnX = x, mxX = x, mnY = y, mxY = y;
-
-        while (queue.length) {
-          const [cx, cy] = queue.shift();
-          cnt++;
-          if (cx < mnX) mnX = cx; if (cx > mxX) mxX = cx;
-          if (cy < mnY) mnY = cy; if (cy > mxY) mxY = cy;
-          for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-            const nx = cx+dx, ny = cy+dy;
-            if (nx<0||nx>=w||ny<0||ny>=h||visited[ny*w+nx]) continue;
-            const ni = (ny*w+nx)*4;
-            if (d[ni]>180 && d[ni+1]>120 && d[ni+2]<120 && d[ni]-d[ni+2]>80) {
-              visited[ny*w+nx] = 1; queue.push([nx, ny]);
-            }
-          }
-        }
-
-        const bw = mxX-mnX+1, bh = mxY-mnY+1;
-        if (cnt > 12 && bw < 55 && bh < 55 && bw/bh < 2.5 && bh/bw < 2.5) {
-          candidates.push({ cx: mnX + bw/2, cy: mnY + bh/2, w: bw, h: bh });
-        }
-      }
-    }
-    return candidates;
-  }
-
-  // ── Find panel bounds via brightness scan ─────────────────
   function findPanelBounds(img) {
     const W = img.naturalWidth, H = img.naturalHeight;
     const { ctx } = getPixels(img, 0, 0, 1, 1);
     const px = ctx.getImageData(0, 0, W, H).data;
 
-    const threshold = W * 0.35;
+    const threshold = W * 0.3;
     const blocks = [];
     let inBlock = false, blockStart = 0;
 
     for (let y = 0; y < H; y++) {
       let bright = 0;
       for (let x = 0; x < W; x++) {
-        const i = (y*W+x)*4;
-        if (px[i] + px[i+1] + px[i+2] > 660) bright++;
+        const i = (y * W + x) * 4;
+        if (px[i] + px[i+1] + px[i+2] > 630) bright++;
       }
-      if (!inBlock && bright > threshold)  { inBlock = true; blockStart = y; }
+      if (!inBlock && bright > threshold) { inBlock = true; blockStart = y; }
       else if (inBlock && bright <= threshold) {
-        if (y - blockStart > 20) blocks.push([blockStart, y-1]);
+        if (y - blockStart > 20) blocks.push([blockStart, y - 1]);
         inBlock = false;
       }
     }
-    if (inBlock) blocks.push([blockStart, H-1]);
+    if (inBlock) blocks.push([blockStart, H - 1]);
 
-    if (blocks.length === 0) return [Math.round(H*0.15), Math.round(H*0.92)];
-    return blocks.reduce((a, b) => (b[1]-b[0] > a[1]-a[0]) ? b : a);
+    if (blocks.length === 0) return [0.15, 0.92];
+
+    // Use the largest bright block
+    const best = blocks.reduce((a, b) => (b[1] - b[0] > a[1] - a[0]) ? b : a);
+    return [best[0] / H, best[1] / H];
+  }
+
+  /**
+   * Parse OCR text from the troop panel into totals and best tiers.
+   * Strategy:
+   *   - Scan line by line
+   *   - When a line contains a troop type keyword, record the type + tier
+   *   - Look for numbers on same line or immediately following lines
+   *   - Accumulate counts per type (all tiers summed)
+   *   - Track highest base tier per type
+   */
+  function parseTroopText(text) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const totals   = { inf: 0, cav: 0, arc: 0 };
+    const bestTier = { inf: 0, cav: 0, arc: 0 };
+
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      const types = getTypesInLine(line);
+
+      if (types.length === 0) { i++; continue; }
+
+      const tier = getTierFromName(line);
+      let nums = extractNums(line);
+
+      // Lookahead: scan up to 3 following lines for missing counts
+      // Stop if we hit another type-keyword line
+      let lookAhead = 0;
+      while (nums.length < types.length && lookAhead < 3) {
+        const nextIdx = i + 1 + lookAhead;
+        if (nextIdx >= lines.length) break;
+        const nextLine = lines[nextIdx];
+        if (getTypesInLine(nextLine).length > 0) break; // next troop block started
+        const nextNums = extractNums(nextLine);
+        if (nextNums.length > 0) {
+          nums = nums.concat(nextNums);
+        }
+        lookAhead++;
+      }
+
+      // Assign numbers to types in left-to-right order
+      for (let j = 0; j < types.length; j++) {
+        const tp = types[j];
+        if (j < nums.length && nums[j] >= 1) {
+          totals[tp] += nums[j];
+          if (tier > bestTier[tp]) bestTier[tp] = tier;
+        }
+      }
+
+      i += 1 + lookAhead;
+    }
+
+    return { totals, bestTier };
+  }
+
+  // ── TG Badge Detection ────────────────────────────────────
+  //
+  // IMPORTANT — How TG badges work in game (from annotated screenshot):
+  //
+  //   Each Apex troop hexagon icon has TWO badge overlays:
+  //
+  //   1) TOP-LEFT corner: small GOLD CIRCLE with ARABIC digit (1, 2, 3, 4, 5)
+  //      → This is the TG LEVEL badge (Training Ground upgrade level)
+  //      → This is what we need to detect!
+  //
+  //   2) BOTTOM of hex: small badge with ROMAN NUMERAL (I, II, ... X)
+  //      → This is the TROOP TIER (T1=I, T9=IX, T10=X)
+  //      → NOT the TG level — do not read this for TG
+  //
+  // Detection approach:
+  //   - Find gold circular clusters (R>180, G>120, B<120, R-B>80)
+  //   - Small size (under 40px), roughly circular
+  //   - OCR with digit whitelist '12345' (valid TG range)
+  //   - Take the highest digit found (most reliable read)
+
+  function detectTGBadgeCandidates(img) {
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const { ctx } = getPixels(img, 0, 0, 1, 1);
+    const d = ctx.getImageData(0, 0, W, H).data;
+    const visited = new Uint8Array(W * H);
+    const candidates = [];
+
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const idx = y * W + x;
+        if (visited[idx]) continue;
+
+        const i = idx * 4;
+        const r = d[i], g = d[i+1], b = d[i+2];
+
+        // Gold pixel: high red, medium-high green, low blue
+        if (!(r > 175 && g > 115 && b < 110 && r - b > 85)) continue;
+
+        // Flood fill the gold cluster
+        const queue = [idx];
+        visited[idx] = 1;
+        let cnt = 0, mnX = x, mxX = x, mnY = y, mxY = y;
+
+        while (queue.length) {
+          const cur = queue.pop();
+          const cy = Math.floor(cur / W);
+          const cx = cur % W;
+          cnt++;
+          if (cx < mnX) mnX = cx; if (cx > mxX) mxX = cx;
+          if (cy < mnY) mnY = cy; if (cy > mxY) mxY = cy;
+
+          for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+            const nx = cx + dx, ny = cy + dy;
+            if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+            const ni = ny * W + nx;
+            if (visited[ni]) continue;
+            const np = ni * 4;
+            if (d[np] > 165 && d[np+1] > 105 && d[np+2] < 120 && d[np] - d[np+2] > 75) {
+              visited[ni] = 1;
+              queue.push(ni);
+            }
+          }
+        }
+
+        const bw = mxX - mnX + 1;
+        const bh = mxY - mnY + 1;
+        const aspect = bw / Math.max(bh, 1);
+
+        // Filter: small enough to be an icon badge, roughly circular
+        if (cnt >= 10 && bw <= 50 && bh <= 50 && aspect >= 0.5 && aspect <= 2.0) {
+          candidates.push({
+            cx: mnX + bw / 2,
+            cy: mnY + bh / 2,
+            w: bw, h: bh, cnt
+          });
+        }
+      }
+    }
+
+    return candidates;
+  }
+
+  /**
+   * OCR a single TG badge candidate.
+   * The badge is a gold circle with a white Arabic digit inside (1-5).
+   * We invert: white digit text → black on white background.
+   */
+  async function readTGBadgeDigit(img, badge) {
+    const W = img.naturalWidth, H = img.naturalHeight;
+
+    // Expand crop area generously around the badge center
+    const pad = Math.max(badge.w, badge.h) * 1.2;
+    const bx0 = Math.max(0, Math.round(badge.cx - pad));
+    const by0 = Math.max(0, Math.round(badge.cy - pad));
+    const bx1 = Math.min(W, Math.round(badge.cx + pad));
+    const by1 = Math.min(H, Math.round(badge.cy + pad));
+    const bw = bx1 - bx0, bh = by1 - by0;
+    if (bw < 4 || bh < 4) return 0;
+
+    // Draw at 10x scale for single-digit OCR accuracy
+    const scale = 10;
+    const bc = document.createElement('canvas');
+    bc.width = bw * scale; bc.height = bh * scale;
+    const bctx = bc.getContext('2d');
+    bctx.imageSmoothingEnabled = false;
+    bctx.drawImage(img, bx0, by0, bw, bh, 0, 0, bc.width, bc.height);
+
+    // Convert: white/light digit pixels → black; gold background → white
+    const bid = bctx.getImageData(0, 0, bc.width, bc.height);
+    const bd = bid.data;
+    for (let k = 0; k < bd.length; k += 4) {
+      const r = bd[k], g = bd[k+1], b = bd[k+2];
+      // White/light pixels (the digit text) → black
+      const isLight = r > 200 && g > 180 && b > 155;
+      // Also catch slightly off-white
+      const isText = r > 185 && g > 170 && b > 140 && Math.max(r,g,b) - Math.min(r,g,b) < 40;
+      bd[k] = bd[k+1] = bd[k+2] = (isLight || isText) ? 0 : 255;
+      bd[k+3] = 255;
+    }
+    bctx.putImageData(bid, 0, 0);
+
+    try {
+      // PSM 10 = single character, whitelist only valid TG digits 1-5
+      const text = await runOCR(bc, 10, '12345');
+      const digit = text.trim().replace(/[^1-5]/g, '');
+      if (digit.length === 1) return parseInt(digit, 10);
+    } catch (_) { /* ignore */ }
+    return 0;
+  }
+
+  /**
+   * Main TG detection: find all gold badge candidates,
+   * OCR each one, return the highest valid digit found.
+   * Higher TG level = more meaningful for tier selection.
+   */
+  async function detectTGLevel(img, setStatus) {
+    setStatus('🔍 Detecting TG level…', '#90b8d8');
+
+    const candidates = detectTGBadgeCandidates(img);
+
+    if (candidates.length === 0) return 0;
+
+    // Sort by size (larger = more likely a real badge), take top 8
+    const top = candidates
+      .sort((a, b) => b.cnt - a.cnt)
+      .slice(0, 8);
+
+    let maxTG = 0;
+    for (const badge of top) {
+      const digit = await readTGBadgeDigit(img, badge);
+      if (digit > maxTG) maxTG = digit;
+    }
+
+    return maxTG;
   }
 
   // ── Main troop extraction ─────────────────────────────────
   async function extractTroops(file, setStatus) {
     setStatus('⏳ Loading image…', '#90b8d8');
     const img = await fileToImage(file);
-    const W = img.naturalWidth, H = img.naturalHeight;
 
     setStatus('⏳ Finding content panel…', '#90b8d8');
-    const [panelTop, panelBot] = findPanelBounds(img);
-    const ytop = panelTop / H;
-    const ybot = panelBot / H;
+    const [ytop, ybot] = findPanelBounds(img);
 
+    // Build B&W canvas of full panel width, 3× scale, dark text on light bg
     const isDarkText = (r, g, b) => r + g + b < 320;
+    const bwFull = buildBWCanvas(img, 0.02, ytop, 0.98, ybot, isDarkText, 3);
 
-    setStatus('🔍 Reading troops…', '#90b8d8');
+    setStatus('🔍 Reading troops (pass 1/2)…', '#90b8d8');
+    const text1 = await runOCR(bwFull, 6, null);
 
-    // Build B&W canvases for left and right columns (3× scale)
-    const bwLeft  = buildBWCanvas(img, 0.03, ytop, 0.52, ybot, isDarkText, 3);
-    const bwRight = buildBWCanvas(img, 0.48, ytop, 0.97, ybot, isDarkText, 3);
+    // Second pass with PSM 4 (column detection) for better multi-column layouts
+    setStatus('🔍 Reading troops (pass 2/2)…', '#90b8d8');
+    const text2 = await runOCR(bwFull, 4, null);
 
-    // OCR each column with 3 PSM modes; merge-best across all 6 results
-    const PSM_MODES = [4, 6, 11];
-    const allResults = [];
+    // Parse both passes and merge by taking highest count per type
+    const r1 = parseTroopText(text1);
+    const r2 = parseTroopText(text2);
 
-    for (const psm of PSM_MODES) {
-      const tL = await runOCR(bwLeft,  psm, null);
-      allResults.push(parseColumnText(tL));
-      const tR = await runOCR(bwRight, psm, null);
-      allResults.push(parseColumnText(tR));
+    const totals   = { inf: 0, cav: 0, arc: 0 };
+    const bestTier = { inf: 0, cav: 0, arc: 0 };
+
+    for (const tp of ['inf', 'cav', 'arc']) {
+      totals[tp]   = Math.max(r1.totals[tp],   r2.totals[tp]);
+      bestTier[tp] = Math.max(r1.bestTier[tp], r2.bestTier[tp]);
     }
 
-    const { totals, bestTier } = mergeBest(allResults);
-
-    // Archer's tier drives the select value
-    // Fall back to best overall tier if archer was not found
+    // Use archer's tier as primary (it's the most important for this app)
+    // Fall back to any detected tier if archer not found
     const archerTier = bestTier.arc > 0
       ? bestTier.arc
-      : Math.max(bestTier.inf, bestTier.cav, bestTier.arc);
+      : Math.max(bestTier.inf, bestTier.cav, 0);
 
-    // TG badge detection (only meaningful for T10/Apex)
+    // TG detection — only meaningful for T10 (Apex) troops
     let tgLevel = 0;
     if (archerTier >= 10) {
-      setStatus('🔍 Detecting TG level…', '#90b8d8');
-      const candidates = detectTGBadgeCandidates(img);
-
-      for (const badge of candidates.slice(0, 12)) {
-        const pad = Math.max(badge.w, badge.h) * 0.9;
-        const bx0 = Math.max(0, Math.round(badge.cx - pad));
-        const by0 = Math.max(0, Math.round(badge.cy - pad));
-        const bx1 = Math.min(W, Math.round(badge.cx + pad));
-        const by1 = Math.min(H, Math.round(badge.cy + pad));
-        const bw  = bx1 - bx0, bh = by1 - by0;
-        if (bw < 4 || bh < 4) continue;
-
-        const bc = document.createElement('canvas');
-        bc.width = bw * 8; bc.height = bh * 8;
-        const bctx = bc.getContext('2d');
-        bctx.scale(8, 8);
-        bctx.drawImage(img, bx0, by0, bw, bh, 0, 0, bw, bh);
-
-        // Invert: white digit text on gold → black on white
-        const bid = bctx.getImageData(0, 0, bc.width, bc.height);
-        const bd  = bid.data;
-        for (let k = 0; k < bd.length; k += 4) {
-          const isW = bd[k]>200 && bd[k+1]>185 && bd[k+2]>160;
-          bd[k] = bd[k+1] = bd[k+2] = isW ? 0 : 255;
-        }
-        bctx.putImageData(bid, 0, 0);
-
-        try {
-          const badgeText = await runOCR(bc, 10, '0123456789');
-          const digit = badgeText.trim().replace(/\D/g, '');
-          if (digit >= '1' && digit <= '5') {
-            const v = parseInt(digit, 10);
-            if (v > tgLevel) tgLevel = v;
-          }
-        } catch (_) { /* ignore single-badge OCR errors */ }
-      }
+      tgLevel = await detectTGLevel(img, setStatus);
     }
 
     const selectVal = tierToSelectValue(archerTier, tgLevel);
@@ -483,6 +592,9 @@
   // UI helpers
   // ══════════════════════════════════════════════════════════
 
+  /**
+   * Set an input field value and flash it green to indicate auto-fill.
+   */
   function setField(id, val) {
     const el = document.getElementById(id);
     if (!el || val == null || isNaN(val)) return;
@@ -495,26 +607,30 @@
     setTimeout(() => { el.style.background = ''; el.style.outline = ''; }, 1600);
   }
 
+  /**
+   * Create an import button bar with file input and status text.
+   */
   function makeBar(btnLabel, inputId, onFile) {
     const wrap = document.createElement('div');
     wrap.style.cssText = [
-      'width:100%','box-sizing:border-box',
-      'display:flex','flex-direction:column','align-items:center','gap:8px',
-      'padding:12px 16px','margin-bottom:10px',
-      'background:#0d1520','border:1px solid #2a3850','border-radius:8px',
+      'width:100%', 'box-sizing:border-box',
+      'display:flex', 'flex-direction:column', 'align-items:center', 'gap:8px',
+      'padding:12px 16px', 'margin-bottom:10px',
+      'background:#0d1520', 'border:1px solid #2a3850', 'border-radius:8px',
     ].join(';');
 
     const lbl = document.createElement('label');
     lbl.htmlFor = inputId;
     lbl.style.cssText = [
-      'display:inline-flex','align-items:center','justify-content:center','gap:7px',
-      'padding:8px 20px','background:#1a2c44',
-      'border:1px solid #3a5878','border-radius:8px',
-      'color:#90b8d8','font-size:14px','font-weight:600',
-      'cursor:pointer','white-space:nowrap',
-      'transition:background .15s,border-color .15s,color .15s',
+      'display:inline-flex', 'align-items:center', 'justify-content:center', 'gap:7px',
+      'padding:8px 20px', 'background:#1a2c44',
+      'border:1px solid #3a5878', 'border-radius:8px',
+      'color:#90b8d8', 'font-size:14px', 'font-weight:600',
+      'cursor:pointer', 'white-space:nowrap',
+      'transition:background .15s, border-color .15s, color .15s',
     ].join(';');
     lbl.textContent = btnLabel;
+
     lbl.addEventListener('mouseenter', () => {
       lbl.style.background = '#243a58';
       lbl.style.borderColor = '#5a90c0';
@@ -527,14 +643,17 @@
     });
 
     const inp = document.createElement('input');
-    inp.type = 'file'; inp.id = inputId; inp.accept = 'image/*'; inp.style.display = 'none';
+    inp.type = 'file';
+    inp.id = inputId;
+    inp.accept = 'image/*';
+    inp.style.display = 'none';
 
     const status = document.createElement('div');
     status.style.cssText = [
-      'font-size:12px','color:#4a6080',
-      'width:100%','box-sizing:border-box',
-      'text-align:center','word-break:break-word',
-      'line-height:1.5','min-height:1.3em',
+      'font-size:12px', 'color:#4a6080',
+      'width:100%', 'box-sizing:border-box',
+      'text-align:center', 'word-break:break-word',
+      'line-height:1.5', 'min-height:1.3em',
     ].join(';');
     status.textContent = 'Processed locally — no data sent anywhere';
 
@@ -544,26 +663,31 @@
     }
 
     inp.addEventListener('change', async e => {
-      const file = e.target.files[0]; if (!file) return;
+      const file = e.target.files[0];
+      if (!file) return;
       e.target.value = '';
-      lbl.style.opacity = '0.5'; lbl.style.pointerEvents = 'none';
+      lbl.style.opacity = '0.5';
+      lbl.style.pointerEvents = 'none';
       try {
         await onFile(file, setStatus);
       } catch (err) {
         console.error('[OCR]', err);
         setStatus('❌ ' + err.message, '#e05555');
       } finally {
-        lbl.style.opacity = ''; lbl.style.pointerEvents = '';
+        lbl.style.opacity = '';
+        lbl.style.pointerEvents = '';
       }
     });
 
-    wrap.appendChild(lbl); wrap.appendChild(inp); wrap.appendChild(status);
+    wrap.appendChild(lbl);
+    wrap.appendChild(inp);
+    wrap.appendChild(status);
     return wrap;
   }
 
-  // ── Inject stat bar ───────────────────────────────────────
+  // ── Inject stat import bar ────────────────────────────────
   function injectStatBar() {
-    const FIELD_IDS = ['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let'];
+    const FIELD_IDS = ['inf_atk', 'inf_let', 'cav_atk', 'cav_let', 'arc_atk', 'arc_let'];
 
     const bar = makeBar('📷 Import stats from screenshot', 'ocrStatFile', async (file, setStatus) => {
       const stats = await extractStats(file, setStatus);
@@ -581,21 +705,21 @@
           '#4caf88'
         );
       } else {
-        setStatus(`⚠️ Got ${filled}/6 — check remaining fields`, '#e0a055');
+        setStatus(`⚠️ Got ${filled}/6 stats — check remaining fields`, '#e0a055');
       }
 
-      if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
+      if (window.OptionA && window.OptionA.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
     });
 
     const statsGrid = document.querySelector('.grid.grid-stats');
     if (statsGrid && statsGrid.parentElement) {
       statsGrid.parentElement.insertBefore(bar, statsGrid);
     } else {
-      console.warn('[OCR] .grid.grid-stats not found');
+      console.warn('[OCR] .grid.grid-stats not found — stat bar not injected');
     }
   }
 
-  // ── Inject troop bar ──────────────────────────────────────
+  // ── Inject troop import bar ───────────────────────────────
   function injectTroopBar() {
     const bar = makeBar('📷 Import troops from screenshot', 'ocrTroopFile', async (file, setStatus) => {
       const troops = await extractTroops(file, setStatus);
@@ -608,7 +732,7 @@
       setField('stockCav', Math.round(troops.cav));
       setField('stockArc', Math.round(troops.arc));
 
-      // Set tier dropdown (based on archer's tier + TG level)
+      // Set tier dropdown
       if (troops.selectVal) {
         const sel = document.getElementById('troopTier');
         if (sel) {
@@ -630,20 +754,21 @@
 
       const fmt = n => Number(n).toLocaleString();
       const tierStr = troops.archerTier > 0 ? ` · Tier → ${troops.selectVal}` : '';
+      const tgStr   = troops.tgLevel > 0 ? ` (TG${troops.tgLevel})` : '';
       setStatus(
-        `✅ INF ${fmt(troops.inf)} CAV ${fmt(troops.cav)} ARC ${fmt(troops.arc)}${tierStr}`,
+        `✅ INF ${fmt(troops.inf)} CAV ${fmt(troops.cav)} ARC ${fmt(troops.arc)}${tierStr}${tgStr}`,
         '#4caf88'
       );
 
-      if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
-      if (window.Magic?.compute)      setTimeout(() => window.Magic.compute('magic12'), 200);
+      if (window.OptionA && window.OptionA.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
+      if (window.Magic  && window.Magic.compute)       setTimeout(() => window.Magic.compute('magic12'), 200);
     });
 
     const troopGrid = document.querySelector('.grid.grid-two');
     if (troopGrid && troopGrid.parentElement) {
       troopGrid.parentElement.insertBefore(bar, troopGrid);
     } else {
-      console.warn('[OCR] .grid.grid-two not found');
+      console.warn('[OCR] .grid.grid-two not found — troop bar not injected');
     }
   }
 
@@ -651,7 +776,8 @@
   function init() {
     injectStatBar();
     injectTroopBar();
-    getTesseract().catch(() => {});  // pre-warm in background
+    // Pre-warm Tesseract in background so first use is faster
+    getTesseract().catch(() => {});
   }
 
   if (document.readyState === 'loading') {
