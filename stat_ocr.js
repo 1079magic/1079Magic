@@ -176,18 +176,16 @@
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     const results = {};
 
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
+    for (const line of lines) {
       for (const [key, re] of Object.entries(STAT_KEYWORDS)) {
-        if (key in results) continue;
-        if (!re.test(line)) continue;
-
-        // Keyword found — look for value on this line, then prev/next line.
-        // Split-line case occurs when navigation arrows (< >) on the
-        // Cavalry Attack row cause Tesseract to break the line in two.
-        let val = parseStatValue(line);
-        if (val === null && i > 0)                val = parseStatValue(lines[i - 1]);
-        if (val === null && i < lines.length - 1) val = parseStatValue(lines[i + 1]);
+        if (key in results || !re.test(line)) continue;
+        // Both keyword AND value must be on the same line.
+        // parseStatValue handles the arrow-noise case where Tesseract
+        // drops the decimal separator ("+4127%" → 412.7).
+        // Never look at adjacent lines — they belong to different stat rows
+        // and would cause wrong values to be grabbed (e.g. Infantry Health
+        // appearing just above the Cavalry Attack row).
+        const val = parseStatValue(line);
         if (val !== null) results[key] = val;
       }
     }
