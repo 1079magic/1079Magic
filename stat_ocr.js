@@ -608,14 +608,25 @@
     const r1 = parseTroopText(text1);
     const r2 = parseTroopText(text2);
 
-    // Merge passes: PSM-6 is primary. Only fall back to PSM-4 when
-    // PSM-6 returns 0 for a type (completely missed it).
-    // Do NOT use Math.max — it can inflate counts when one pass picks up
-    // a wrong number that happens to be larger than the correct one.
+    // Merge passes with cross-validation:
+    // • If both agree within 5% → use PSM-6 (it's the primary/more stable pass)
+    // • If they disagree by >5% → use PSM-4 (digit errors in one pass corrected by other)
+    // • If one pass returns 0 → use whichever got a value
+    // This catches cases where a single digit is misread by one engine
+    // (e.g. PSM-6 reads "389,717" instead of "359,717" due to 5→8 confusion).
     const totals   = { inf: 0, cav: 0, arc: 0 };
     const bestTier = { inf: 0, cav: 0, arc: 0 };
     for (const tp of ['inf', 'cav', 'arc']) {
-      totals[tp]   = r1.totals[tp]   > 0 ? r1.totals[tp]   : r2.totals[tp];
+      const v6 = r1.totals[tp] || 0;
+      const v4 = r2.totals[tp] || 0;
+      if (v6 === 0 && v4 === 0) { totals[tp] = 0; }
+      else if (v6 === 0)        { totals[tp] = v4; }
+      else if (v4 === 0)        { totals[tp] = v6; }
+      else {
+        // Both have a value — cross-validate
+        const diff = Math.abs(v6 - v4) / Math.max(v6, v4);
+        totals[tp] = diff < 0.05 ? v6 : v4; // >5% disagreement → trust PSM-4
+      }
       bestTier[tp] = r1.bestTier[tp] > 0 ? r1.bestTier[tp] : r2.bestTier[tp];
     }
 
