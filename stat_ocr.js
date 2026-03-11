@@ -165,94 +165,20 @@
     return results;
   }
 
-  /**
-   * Find the Bonus Details table region by scanning for the characteristic
-   * light-beige/cream rows of the stat table. Returns [y0f, y1f] fractions.
-   * Falls back to full image if not found.
-   * Also detects and crops away black phone-frame borders (gallery/browser screenshots).
-   */
-  function findBonusDetailsRegion(img) {
-    const W = img.naturalWidth, H = img.naturalHeight;
-    const { ctx } = getPixels(img, 0, 0, 1, 1);
-    const px = ctx.getImageData(0, 0, W, H).data;
-
-    // Step 1: Detect content bounds — crop away black phone frame borders.
-    // Scan from each edge inward to find where non-black pixels begin.
-    const BLACK = 40; // threshold: pixels darker than this are frame border
-    let left = 0, right = W - 1, top = 0, bottom = H - 1;
-
-    // Find left edge
-    outer: for (let x = 0; x < W; x++) {
-      for (let y = 0; y < H; y++) {
-        const i = (y * W + x) * 4;
-        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { left = x; break outer; }
-      }
-    }
-    // Find right edge
-    outer: for (let x = W - 1; x >= 0; x--) {
-      for (let y = 0; y < H; y++) {
-        const i = (y * W + x) * 4;
-        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { right = x; break outer; }
-      }
-    }
-    // Find top edge
-    outer: for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        const i = (y * W + x) * 4;
-        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { top = y; break outer; }
-      }
-    }
-    // Find bottom edge
-    outer: for (let y = H - 1; y >= 0; y--) {
-      for (let x = 0; x < W; x++) {
-        const i = (y * W + x) * 4;
-        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { bottom = y; break outer; }
-      }
-    }
-
-    // Step 2: Within the content area, find the Bonus Details table.
-    // The table rows alternate light-beige (R>200, G>185, B>165) across
-    // at least 50% of the content width. Scan row by row.
-    const cw = right - left + 1;
-    const threshold = cw * 0.4;
-    let tableTop = -1, tableBottom = -1;
-    let inTable = false;
-
-    for (let y = top; y <= bottom; y++) {
-      let beigeCount = 0;
-      for (let x = left; x <= right; x++) {
-        const i = (y * W + x) * 4;
-        const r = px[i], g = px[i+1], b = px[i+2];
-        if (r > 195 && g > 180 && b > 155 && r - b < 70) beigeCount++;
-      }
-      const isTableRow = beigeCount > threshold;
-      if (!inTable && isTableRow) { inTable = true; tableTop = y; }
-      if (inTable && !isTableRow && y - tableTop > 30) { tableBottom = y; break; }
-    }
-    if (tableTop < 0) return [top / H, bottom / H, left / W, right / W];
-    if (tableBottom < 0) tableBottom = bottom;
-
-    // Add a small margin
-    const margin = Math.round((tableBottom - tableTop) * 0.05);
-    return [
-      Math.max(0, (tableTop - margin)) / H,
-      Math.min(1, (tableBottom + margin)) / H,
-      left / W,
-      right / W,
-    ];
-  }
-
   async function extractStats(file, setStatus) {
     setStatus('⏳ Loading image…', '#a0b4d0');
     const img = await fileToImage(file);
     setStatus('🔍 Reading stats…', '#a0b4d0');
 
-    // Find the Bonus Details table region (handles phone-frame/browser screenshots)
-    const [y0f, y1f, x0f, x1f] = findBonusDetailsRegion(img);
-
-    // Build color-filtered canvas: red+black pixels kept, green excluded.
-    // Use higher scale (3×) so tiny/thumbnail images still OCR reliably.
-    const bw = buildBWCanvas(img, x0f, y0f, x1f, y1f, isStatTextPixel, 3);
+    // Scan the full image with color filtering:
+    //   • Red pixels  (left stat values: +420.0% etc)  → kept as black
+    //   • Black pixels (center stat labels)             → kept as black
+    //   • Green pixels (right bonus column: +660% etc)  → excluded (white)
+    //   • Beige/bg                                      → excluded (white)
+    // This works for ALL screenshot formats — Mail popup, Battle Report tab,
+    // portrait or landscape — with no geometry assumptions.
+    // 3× upscale ensures readable text even on small/thumbnail screenshots.
+    const bw = buildBWCanvas(img, 0, 0, 1, 1, isStatTextPixel, 3);
     const text = await runOCR(bw, 6, null);
     return parseStatsFromText(text);
   }
@@ -376,43 +302,67 @@
 
   /**
    * Parse OCR text into troop totals and best tiers.
-   * Scans line by line, detects troop name + tier, reads count
-   * (same line or lookahead), accumulates per type.
+   *
+   * KEY FIX — numBank: When Tesseract reads a 2-column grid it sometimes
+   * merges numbers from different rows onto the same line, e.g.:
+   *   "Apex Infantry Apex Cavalry"
+   *   "209,022  129,042  224,969"   ← 3 numbers for 2 types
+   *
+   * Without the bank, 224,969 is silently dropped, and the next type line
+   * (Apex Archer) then grabs 68,800 (Supreme Cavalry's count) instead.
+   *
+   * With the bank: extra numbers beyond the current line's type count are
+   * carried forward and offered first to the next type line encountered.
+   * This ensures 224,969 is correctly assigned to Apex Archer.
    */
   function parseTroopText(text) {
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     const totals   = { inf: 0, cav: 0, arc: 0 };
     const bestTier = { inf: 0, cav: 0, arc: 0 };
+    let numBank = []; // surplus numbers from previous lines, offered first
     let i = 0;
 
     while (i < lines.length) {
       const line = lines[i];
       const types = getTypesInLine(line);
 
-      if (types.length === 0) { i++; continue; }
+      // Not a type line — collect any numbers into the bank
+      if (types.length === 0) {
+        numBank = numBank.concat(extractNums(line));
+        i++;
+        continue;
+      }
 
       const tier = getTierFromName(line);
-      let nums = extractNums(line);
 
-      // Lookahead: up to 3 lines for missing counts, stop at next type-word line
+      // Start with banked numbers, then inline numbers on the type line
+      let nums = numBank.concat(extractNums(line));
+      numBank = [];
+
+      // Lookahead: consume following number-only lines if still short
       let lookAhead = 0;
       while (nums.length < types.length && lookAhead < 3) {
         const nextIdx = i + 1 + lookAhead;
         if (nextIdx >= lines.length) break;
         const nextLine = lines[nextIdx];
-        if (getTypesInLine(nextLine).length > 0) break;
+        if (getTypesInLine(nextLine).length > 0) break; // next type → stop
         const nextNums = extractNums(nextLine);
         if (nextNums.length > 0) nums = nums.concat(nextNums);
         lookAhead++;
       }
 
-      // Assign counts to types left-to-right
+      // Assign numbers left-to-right to types, accumulate per type
       for (let j = 0; j < types.length; j++) {
         const tp = types[j];
         if (j < nums.length && nums[j] >= 1) {
           totals[tp] += nums[j];
           if (tier > bestTier[tp]) bestTier[tp] = tier;
         }
+      }
+
+      // Bank any surplus numbers for the next type line
+      if (nums.length > types.length) {
+        numBank = nums.slice(types.length);
       }
 
       i += 1 + lookAhead;
@@ -561,15 +511,18 @@
     setStatus('🔍 Reading troops (pass 2/2)…', '#90b8d8');
     const text2 = await runOCR(bwFull, 4, null);
 
-    // Merge: take highest count per type across both passes
     const r1 = parseTroopText(text1);
     const r2 = parseTroopText(text2);
 
+    // Merge passes: PSM-6 is primary. Only fall back to PSM-4 when
+    // PSM-6 returns 0 for a type (completely missed it).
+    // Do NOT use Math.max — it can inflate counts when one pass picks up
+    // a wrong number that happens to be larger than the correct one.
     const totals   = { inf: 0, cav: 0, arc: 0 };
     const bestTier = { inf: 0, cav: 0, arc: 0 };
     for (const tp of ['inf', 'cav', 'arc']) {
-      totals[tp]   = Math.max(r1.totals[tp],   r2.totals[tp]);
-      bestTier[tp] = Math.max(r1.bestTier[tp], r2.bestTier[tp]);
+      totals[tp]   = r1.totals[tp]   > 0 ? r1.totals[tp]   : r2.totals[tp];
+      bestTier[tp] = r1.bestTier[tp] > 0 ? r1.bestTier[tp] : r2.bestTier[tp];
     }
 
     // Archer tier drives tier selection; fall back to best overall
