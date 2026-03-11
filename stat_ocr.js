@@ -222,7 +222,9 @@
       }
       return 'T10';
     }
-    if (baseTier >= 9) return 'T9';
+    // T8 & T9 → T9 (T8 is 1 step from T9, 2 steps from T6 — round to nearest)
+    // T7 and below → T6
+    if (baseTier >= 8) return 'T9';
     return 'T6';
   }
 
@@ -329,70 +331,81 @@
   // ── Main troop extraction ─────────────────────────────────
   async function extractTroops(file, setStatus) {
     setStatus('⏳ Loading image…', '#90b8d8');
-    // fileToImage returns a raw HTMLImageElement (same as extractStats uses)
     const img = await fileToImage(file);
     const w = img.naturalWidth, h = img.naturalHeight;
+
+    // Create ONE worker and reuse it for every recognize() call.
+    // Creating/terminating a worker per call (as runOCR does) is slow and
+    // causes mobile failures when called multiple times in quick succession.
+    setStatus('⏳ Starting OCR engine…', '#90b8d8');
+    const T = await getTesseract();
+    const worker = await T.createWorker('eng', 1, {});
+
+    async function ocr(canvas) {
+      const { data: { text } } = await worker.recognize(canvas, {}, { text: true });
+      return text;
+    }
 
     const totals     = { inf: 0, cav: 0, arc: 0 };
     const bestByType = { inf: null, cav: null, arc: null };
 
-    // Two-column OCR: left [2%-52%] and right [48%-98%]
-    for (const [x0p, x1p] of [[0.02, 0.52], [0.48, 0.98]]) {
-      setStatus('🔍 Reading troop columns…', '#90b8d8');
-      // buildBWCanvas takes the raw HTMLImageElement directly
-      const bwCanvas = buildBWCanvas(img, x0p, 0.18, x1p, 0.90,
-        (r, g, b) => (r + g + b) < 380, 2);
-      const text = await runOCR(bwCanvas, '--psm 6', null);
-      parseTroopColumn(text, totals, bestByType);
-    }
+    try {
+      // Two-column OCR: left [2%-52%] and right [48%-98%]
+      for (const [x0p, x1p] of [[0.02, 0.52], [0.48, 0.98]]) {
+        setStatus('🔍 Reading troop columns…', '#90b8d8');
+        const bwCanvas = buildBWCanvas(img, x0p, 0.18, x1p, 0.90,
+          (r, g, b) => (r + g + b) < 380, 2);
+        const text = await ocr(bwCanvas);
+        parseTroopColumn(text, totals, bestByType);
+      }
 
-    // Find overall best tier
-    let bestTier = 0;
-    for (const bt of Object.values(bestByType)) {
-      if (bt && bt.tier > bestTier) bestTier = bt.tier;
-    }
+      // Find overall best tier
+      let bestTier = 0;
+      for (const bt of Object.values(bestByType)) {
+        if (bt && bt.tier > bestTier) bestTier = bt.tier;
+      }
 
-    // TG badge detection (only for T10 Apex troops)
-    let tgLevel = 0;
-    if (bestTier >= 10) {
-      setStatus('🔍 Detecting TG level…', '#90b8d8');
-      // img is HTMLImageElement — pass directly
-      const candidates = detectTGBadgeCandidates(img, w, h);
-      const votes = [];
-      for (const badge of candidates.slice(0, 8)) {
-        const pad = Math.max(badge.w, badge.h) * 0.9;
-        const bx0=Math.round(badge.cx-pad), by0=Math.round(badge.cy-pad);
-        const bx1=Math.round(badge.cx+pad), by1=Math.round(badge.cy+pad);
-        const bw2=bx1-bx0, bh2=by1-by0;
-        if (bw2 < 4 || bh2 < 4) continue;
-
-        // Crop badge area, isolate white digit on gold background
-        const bc = document.createElement('canvas');
-        bc.width=bw2*8; bc.height=bh2*8;
-        const bctx = bc.getContext('2d');
-        bctx.scale(8,8);
-        bctx.drawImage(img, bx0, by0, bw2, bh2, 0, 0, bw2, bh2);
-        const bid = bctx.getImageData(0, 0, bc.width, bc.height);
-        const bd = bid.data;
-        for (let k = 0; k < bd.length; k+=4) {
-          const isWhite = bd[k]>200 && bd[k+1]>185 && bd[k+2]>160;
-          const v = isWhite ? 0 : 255;
-          bd[k]=bd[k+1]=bd[k+2]=v;
+      // TG badge detection (only for T10 Apex troops)
+      let tgLevel = 0;
+      if (bestTier >= 10) {
+        setStatus('🔍 Detecting TG level…', '#90b8d8');
+        const candidates = detectTGBadgeCandidates(img, w, h);
+        const votes = [];
+        for (const badge of candidates.slice(0, 8)) {
+          const pad = Math.max(badge.w, badge.h) * 0.9;
+          const bx0=Math.round(badge.cx-pad), by0=Math.round(badge.cy-pad);
+          const bx1=Math.round(badge.cx+pad), by1=Math.round(badge.cy+pad);
+          const bw2=bx1-bx0, bh2=by1-by0;
+          if (bw2 < 4 || bh2 < 4) continue;
+          const bc = document.createElement('canvas');
+          bc.width=bw2*8; bc.height=bh2*8;
+          const bctx = bc.getContext('2d');
+          bctx.scale(8,8);
+          bctx.drawImage(img, bx0, by0, bw2, bh2, 0, 0, bw2, bh2);
+          const bid = bctx.getImageData(0, 0, bc.width, bc.height);
+          const bd = bid.data;
+          for (let k = 0; k < bd.length; k+=4) {
+            const isWhite = bd[k]>200 && bd[k+1]>185 && bd[k+2]>160;
+            bd[k]=bd[k+1]=bd[k+2]= isWhite ? 0 : 255;
+          }
+          bctx.putImageData(bid, 0, 0);
+          const badgeText = await ocr(bc);
+          const digit = badgeText.trim().replace(/\D/g,'');
+          if (digit >= '1' && digit <= '5') votes.push(parseInt(digit));
         }
-        bctx.putImageData(bid, 0, 0);
-        const badgeText = await runOCR(bc, '--psm 10 -c tessedit_char_whitelist=12345', null);
-        const digit = badgeText.trim().replace(/\D/g,'');
-        if (digit >= '1' && digit <= '5') votes.push(parseInt(digit));
+        if (votes.length > 0) {
+          const freq = {};
+          votes.forEach(v => freq[v] = (freq[v]||0)+1);
+          tgLevel = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0]);
+        }
       }
-      if (votes.length > 0) {
-        const freq = {};
-        votes.forEach(v => freq[v] = (freq[v]||0)+1);
-        tgLevel = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0]);
-      }
-    }
 
-    const selectVal = tierToSelectValue(bestTier, tgLevel);
-    return { ...totals, bestTier, tgLevel, selectVal };
+      const selectVal = tierToSelectValue(bestTier, tgLevel);
+      return { ...totals, bestTier, tgLevel, selectVal };
+
+    } finally {
+      await worker.terminate(); // always free memory
+    }
   }
 
   // ── Field fill + flash ────────────────────────────────────
