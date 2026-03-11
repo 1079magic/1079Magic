@@ -135,17 +135,22 @@
     }
 
     // Group into bands (gap > 8px = new band)
-    const bands = [];
+    const rawBands = [];
     if (redRows.length) {
       let s = redRows[0], p = redRows[0];
       for (let i = 1; i < redRows.length; i++) {
-        if (redRows[i] - p > 8) { bands.push([s, p]); s = redRows[i]; }
+        if (redRows[i] - p > 8) { rawBands.push([s, p]); s = redRows[i]; }
         p = redRows[i];
       }
-      bands.push([s, p]);
+      rawBands.push([s, p]);
     }
 
-    // Need at least 11 bands (0=InfAtk ... 10=ArcLet, skip defense/health rows)
+    // Filter out garbage bands at edges: keep only bands ≥8px tall
+    // and whose position is between 50px and (cropH - 50px)
+    const cropH = Math.round((0.96 - 0.25) * H);
+    const bands = rawBands.filter(([s, e]) => (e - s) >= 8 && s > 50 && e < cropH - 50);
+
+    // Need at least 11 valid bands
     if (bands.length < 11) {
       throw new Error(`Only found ${bands.length} stat rows (need 11+). Try a clearer screenshot.`);
     }
@@ -303,12 +308,17 @@
   // ── Build upload bar ──────────────────────────────────────
   function makeBar(btnLabel, inputId, onFile) {
     const wrap = document.createElement('div');
+    // Outer wrapper: column layout — button row on top, status text below
     wrap.style.cssText = [
       'width:100%','box-sizing:border-box',
-      'display:flex','align-items:center','gap:10px',
+      'display:flex','flex-direction:column','gap:6px',
       'padding:8px 12px','margin-bottom:10px',
       'background:#0d1520','border:1px solid #2a3850','border-radius:8px',
     ].join(';');
+
+    // Top row: just the button
+    const topRow = document.createElement('div');
+    topRow.style.cssText = 'display:flex;align-items:center;gap:10px;';
 
     const lbl = document.createElement('label');
     lbl.htmlFor = inputId;
@@ -327,8 +337,12 @@
     const inp = document.createElement('input');
     inp.type = 'file'; inp.id = inputId; inp.accept = 'image/*'; inp.style.display = 'none';
 
-    const status = document.createElement('span');
-    status.style.cssText = 'font-size:12px;color:#4a6080;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+    topRow.appendChild(lbl);
+    topRow.appendChild(inp);
+
+    // Status line below the button — full width, wraps freely
+    const status = document.createElement('div');
+    status.style.cssText = 'font-size:12px;color:#4a6080;width:100%;box-sizing:border-box;word-break:break-word;line-height:1.4;min-height:1.2em;';
     status.textContent = 'Tap to upload screenshot — processed locally, no data sent anywhere';
 
     function setStatus(msg, color) { status.textContent = msg; status.style.color = color || '#4a6080'; }
@@ -347,7 +361,8 @@
       }
     });
 
-    wrap.appendChild(lbl); wrap.appendChild(inp); wrap.appendChild(status);
+    wrap.appendChild(topRow);
+    wrap.appendChild(status);
     return wrap;
   }
 
@@ -407,7 +422,31 @@
       if (window.Magic?.compute)      setTimeout(() => window.Magic.compute('magic12'), 200);
     });
 
-    // Insert BEFORE the grid — above it, not inside it
+    // Prefer inserting right before the stockInf input's closest labelled row,
+    // so the bar always appears directly above the troop count inputs —
+    // not in a gap between unrelated sections.
+    const stockInfEl = document.getElementById('stockInf');
+    if (stockInfEl) {
+      // Walk up to find the element that is a direct child of `parent`
+      let anchor = stockInfEl;
+      while (anchor && anchor.parentElement !== parent) anchor = anchor.parentElement;
+      if (anchor) {
+        // Also look for a sibling label/heading just before this anchor
+        // to insert before the label rather than mid-section
+        let insertBefore = anchor;
+        const prev = anchor.previousElementSibling;
+        if (prev && !prev.querySelector('#stockInf,#stockCav,#stockArc')) {
+          // There's a label/header row before the inputs — insert before that
+          insertBefore = prev;
+          // But only if prev doesn't contain other important inputs
+          const hasOtherInputs = prev.querySelector('input,select,textarea');
+          if (hasOtherInputs) insertBefore = anchor;
+        }
+        parent.insertBefore(bar, insertBefore);
+        return;
+      }
+    }
+    // Fallback
     parent.insertBefore(bar, grid);
   }
 
