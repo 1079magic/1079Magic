@@ -100,7 +100,15 @@
         }
       }
     });
-    const { data: { text } } = await worker.recognize(canvas, {}, { text: true });
+    // Tesseract.js ignores CLI-style strings like '--psm 7'.
+    // Parse the config string and apply via setParameters() instead.
+    const params = {};
+    const psmMatch = (config || '').match(/--psm\s+(\d+)/);
+    if (psmMatch) params.tessedit_pageseg_mode = psmMatch[1];
+    const wlMatch  = (config || '').match(/tessedit_char_whitelist=(\S+)/);
+    if (wlMatch)  params.tessedit_char_whitelist = wlMatch[1];
+    if (Object.keys(params).length) await worker.setParameters(params);
+    const { data: { text } } = await worker.recognize(canvas.toDataURL('image/png'));
     await worker.terminate();
     return text;
   }
@@ -340,9 +348,16 @@
     setStatus('⏳ Starting OCR engine…', '#90b8d8');
     const T = await getTesseract();
     const worker = await T.createWorker('eng', 1, {});
+    // PSM 6 = "uniform block of text" — essential for reading cropped column images.
+    // Must be set via setParameters(); passing '--psm 6' as a string is ignored by Tesseract.js.
+    await worker.setParameters({ tessedit_pageseg_mode: '6' });
 
+    // Convert canvas → data URL before passing to worker.recognize().
+    // Canvas elements may not transfer correctly across worker thread boundaries
+    // in all browsers; a data URL string is always safe.
     async function ocr(canvas) {
-      const { data: { text } } = await worker.recognize(canvas, {}, { text: true });
+      const dataUrl = canvas.toDataURL('image/png');
+      const { data: { text } } = await worker.recognize(dataUrl);
       return text;
     }
 
