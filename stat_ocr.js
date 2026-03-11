@@ -289,21 +289,7 @@
     setTimeout(() => { el.style.background = ''; el.style.outline = ''; }, 1600);
   }
 
-  // Returns the innermost element containing all IDs, and its parent.
-  // Bar gets inserted as parent.insertBefore(bar, grid) — sits ABOVE the grid,
-  // never inside it, so it cannot disrupt column/flex layout.
-  function findContainerAndParent(ids) {
-    const first = document.getElementById(ids[0]);
-    if (!first) return null;
-    let el = first.parentElement;
-    while (el) {
-      if (ids.every(id => el.querySelector('#' + id))) {
-        return { grid: el, parent: el.parentElement || el };
-      }
-      el = el.parentElement;
-    }
-    return null;
-  }
+  // (findContainerAndParent removed — using direct CSS selector targeting)
 
   // ── Build upload bar ──────────────────────────────────────
   function makeBar(btnLabel, inputId, onFile) {
@@ -367,11 +353,10 @@
   }
 
   // ── Inject stat bar ───────────────────────────────────────
+  // HTML structure: .panel > .grid.grid-stats (3-col: Infantry | Cavalry | Archers)
+  // We insert the bar directly before .grid.grid-stats inside the panel.
   function injectStatBar() {
     const ids = ['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let'];
-    const found = findContainerAndParent(ids);
-    if (!found) { console.warn('[OCR] stat container not found'); return; }
-    const { grid, parent } = found;
 
     const bar = makeBar('📷 Import stats from screenshot', 'ocrStatFile', async (file, setStatus) => {
       const stats = await extractStats(file, setStatus);
@@ -393,17 +378,21 @@
       if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
     });
 
-    // Insert BEFORE the grid — above it, not inside it
-    parent.insertBefore(bar, grid);
+    // Target: the .grid.grid-stats div (3-col stat grid)
+    // Insert before it inside its parent (.panel)
+    const statsGrid = document.querySelector('.grid.grid-stats');
+    if (statsGrid && statsGrid.parentElement) {
+      statsGrid.parentElement.insertBefore(bar, statsGrid);
+    } else {
+      console.warn('[OCR] .grid.grid-stats not found');
+    }
   }
 
   // ── Inject troop bar ──────────────────────────────────────
+  // HTML structure: .panel > .grid.grid-two (2-col: Your available troops | Formation settings)
+  // The left column contains stockInf/Cav/Arc.
+  // We insert the bar directly BEFORE the entire .grid.grid-two div.
   function injectTroopBar() {
-    const ids = ['stockInf','stockCav','stockArc'];
-    const found = findContainerAndParent(ids);
-    if (!found) { console.warn('[OCR] troop container not found'); return; }
-    const { grid, parent } = found;
-
     const bar = makeBar('📷 Import troops from screenshot', 'ocrTroopFile', async (file, setStatus) => {
       const troops = await extractTroops(file, setStatus);
 
@@ -422,35 +411,17 @@
       if (window.Magic?.compute)      setTimeout(() => window.Magic.compute('magic12'), 200);
     });
 
-    // Prefer inserting right before the stockInf input's closest labelled row,
-    // so the bar always appears directly above the troop count inputs —
-    // not in a gap between unrelated sections.
-    const stockInfEl = document.getElementById('stockInf');
-    if (stockInfEl) {
-      // Walk up to find the element that is a direct child of `parent`
-      let anchor = stockInfEl;
-      while (anchor && anchor.parentElement !== parent) anchor = anchor.parentElement;
-      if (anchor) {
-        // Also look for a sibling label/heading just before this anchor
-        // to insert before the label rather than mid-section
-        let insertBefore = anchor;
-        const prev = anchor.previousElementSibling;
-        if (prev && !prev.querySelector('#stockInf,#stockCav,#stockArc')) {
-          // There's a label/header row before the inputs — insert before that
-          insertBefore = prev;
-          // But only if prev doesn't contain other important inputs
-          const hasOtherInputs = prev.querySelector('input,select,textarea');
-          if (hasOtherInputs) insertBefore = anchor;
-        }
-        parent.insertBefore(bar, insertBefore);
-        return;
-      }
+    // Target: .grid.grid-two (the 2-col troops + formation grid)
+    // Insert before it inside its parent (.panel)
+    const troopGrid = document.querySelector('.grid.grid-two');
+    if (troopGrid && troopGrid.parentElement) {
+      troopGrid.parentElement.insertBefore(bar, troopGrid);
+    } else {
+      console.warn('[OCR] .grid.grid-two not found');
     }
-    // Fallback
-    parent.insertBefore(bar, grid);
   }
 
-  // ── Init: inject both bars, pre-warm Tesseract ───────────
+    // ── Init: inject both bars, pre-warm Tesseract ───────────
   function init() {
     injectStatBar();
     injectTroopBar();
