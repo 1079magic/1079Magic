@@ -205,75 +205,205 @@
   //
   // Single parser handles both by reading name + lookahead for number.
 
-  async function extractTroops(file, setStatus) {
-    setStatus('⏳ Loading image…', '#a0b4d0');
-    const img = await fileToImage(file);
+  // ── Troop tier name → numeric tier ───────────────────────
+  const TROOP_TIER_NAMES = {
+    recruit:1, warrior:2, fighter:3, skirmisher:3,
+    guardian:5, sentinel:6, veteran:4, brave:7,
+    elite:8, champion:9, hero:9,
+    apex:10, legend:10, legendary:10,
+  };
+  const TIER_SELECT_OPTIONS = ['T6','T9','T10','T10.TG1','T10.TG2','T10.TG3','T10.TG4','T10.TG5'];
 
-    setStatus('⏳ Running OCR on troop panel…', '#a0b4d0');
-
-    // Convert dark text (any dark pixel on cream/white/dark bg) → black on white
-    const bw = buildBWCanvas(img,
-      0.02, 0.25, 0.98, 0.88,
-      (r, g, b) => (r + g + b) < 420,  // anything noticeably dark
-      2
-    );
-
-    const text = await runOCR(bw, '--psm 6', pct => {
-      setStatus(`⏳ Recognising… ${pct}%`, '#a0b4d0');
-    });
-
-    return parseTroopText(text);
+  function tierToSelectValue(baseTier, tgLevel) {
+    if (baseTier >= 10) {
+      if (tgLevel >= 1) {
+        const opt = `T10.TG${Math.min(tgLevel, 5)}`;
+        return TIER_SELECT_OPTIONS.includes(opt) ? opt : 'T10.TG1';
+      }
+      return 'T10';
+    }
+    if (baseTier >= 9) return 'T9';
+    return 'T6';
   }
 
-  function parseTroopText(text) {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const totals = { inf: 0, cav: 0, arc: 0 };
+  function getTroopType(s) {
+    const l = s.toLowerCase();
+    if (l.includes('infantry')) return 'inf';
+    if (l.includes('cavalry'))  return 'cav';
+    if (l.includes('arch'))     return 'arc';
+    return null;
+  }
 
-    // Extract numbers ≥5 digits, handling dot/comma as thousands separator
-    function extractNums(s) {
-      // Normalise thousands separators: 269.209 → 269209, 269,209 → 269209
-      const s2 = s.replace(/(\d)[.,](\d{3})\b/g, '$1$2');
-      return [...s2.matchAll(/\b(\d{5,})\b/g)].map(m => parseInt(m[1]));
+  function getTroopTier(s) {
+    const l = s.toLowerCase();
+    for (const [name, tier] of Object.entries(TROOP_TIER_NAMES)) {
+      if (l.includes(name)) return tier;
     }
+    return 0;
+  }
 
+  // Number extraction: handles dot / comma / space as thousands separator
+  function extractNums(s) {
+    let s2 = s.replace(/(\d)[.,](\d{3})(?=\D|$)/g, '$1$2');
+    s2 = s2.replace(/(\d{3})\s(\d{3})(?=\D|$)/g, '$1$2');
+    return [...s2.matchAll(/\b(\d{5,})\b/g)].map(m => parseInt(m[1]));
+  }
+  function extractSingleNum(s) {
+    let s2 = s.replace(/(\d)[.,](\d{3})(?=\D|$)/g, '$1$2');
+    s2 = s2.replace(/(\d{3})\s(\d{3})(?=\D|$)/g, '$1$2');
+    const m = s2.match(/\b(\d{3,})\b/);
+    return m ? parseInt(m[1]) : null;
+  }
+
+  // Parse one column's OCR text — accumulate into shared totals + bestByType
+  function parseTroopColumn(text, totals, bestByType) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
-      const hasInf = /infantry/i.test(line);
-      const hasCav = /cavalry/i.test(line);
-      const hasArc = /arch/i.test(line);   // archer OR archers
-      const nums   = extractNums(line);
-
-      if (hasInf && hasCav && !nums.length) {
-        // Two troop names on same line — numbers are on the NEXT number-containing line
-        let j = i + 1;
-        while (j < lines.length && !extractNums(lines[j]).length) j++;
-        if (j < lines.length) {
-          const pair = extractNums(lines[j]);
-          if (pair.length >= 2) { totals.inf += pair[0]; totals.cav += pair[1]; }
-          else if (pair.length === 1) { totals.inf += pair[0]; }
-          i = j;
+      const type = getTroopType(line);
+      const tier = getTroopTier(line);
+      if (type) {
+        let count = extractSingleNum(line);
+        if ((!count || count < 10) && i + 1 < lines.length) {
+          const next = extractSingleNum(lines[i + 1]);
+          if (next && next >= 10) { count = next; i++; }
         }
-      } else if (hasInf && nums.length) {
-        totals.inf += Math.max(...nums);
-      } else if (hasCav && nums.length) {
-        totals.cav += Math.max(...nums);
-      } else if (hasArc && nums.length) {
-        totals.arc += Math.max(...nums);
-      } else if (hasInf || hasCav || hasArc) {
-        // Name without a number — look ahead
-        const key = hasInf ? 'inf' : hasCav ? 'cav' : 'arc';
-        let j = i + 1;
-        while (j < lines.length && !extractNums(lines[j]).length) j++;
-        if (j < lines.length) {
-          const ns = extractNums(lines[j]);
-          if (ns.length) { totals[key] += Math.max(...ns); i = j; }
+        if (count && count >= 10) {
+          totals[type] += count;
+          if (tier > 0 && tier > (bestByType[type]?.tier || 0)) {
+            bestByType[type] = { tier, name: line.replace(/[^a-zA-Z ]/g, '').trim() };
+          }
         }
       }
       i++;
     }
+  }
 
-    return totals;
+  // TG badge scan: find gold pixel clusters in icon area, return candidates
+  function detectTGBadgeCandidates(imgEl, w, h) {
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(imgEl, 0, 0);
+    const y0 = Math.round(h * 0.18), y1 = Math.round(h * 0.75);
+    const id = ctx.getImageData(0, y0, w, y1 - y0);
+    const d = id.data; const W = w, H = y1 - y0;
+
+    const goldMap = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const idx = (y * W + x) * 4;
+        const r = d[idx], g = d[idx+1], b = d[idx+2];
+        if (r > 180 && g > 120 && b < 120 && r - b > 80) goldMap[y * W + x] = 1;
+      }
+    }
+
+    const visited = new Uint8Array(W * H);
+    const candidates = [];
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        if (!goldMap[y * W + x] || visited[y * W + x]) continue;
+        const queue = [[x, y]]; visited[y * W + x] = 1;
+        let mnX=x, mxX=x, mnY=y, mxY=y, cnt=0;
+        while (queue.length) {
+          const [cx, cy] = queue.shift(); cnt++;
+          mnX=Math.min(mnX,cx); mxX=Math.max(mxX,cx);
+          mnY=Math.min(mnY,cy); mxY=Math.max(mxY,cy);
+          for (const [dx,dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+            const nx=cx+dx, ny=cy+dy;
+            if (nx>=0&&nx<W&&ny>=0&&ny<H&&goldMap[ny*W+nx]&&!visited[ny*W+nx]) {
+              visited[ny*W+nx]=1; queue.push([nx,ny]);
+            }
+          }
+        }
+        const bw2=mxX-mnX+1, bh2=mxY-mnY+1;
+        if (cnt>12 && bw2<55 && bh2<55 && bw2/bh2<2.5 && bh2/bw2<2.5) {
+          candidates.push({ cx: mnX+bw2/2, cy: y0+mnY+bh2/2, w: bw2, h: bh2 });
+        }
+      }
+    }
+    return candidates;
+  }
+
+  // ── Main troop extraction ─────────────────────────────────
+  async function extractTroops(file, setStatus) {
+    setStatus('⏳ Loading OCR engine…', '#90b8d8');
+    const worker = await getWorker();
+
+    setStatus('🔍 Reading troop columns…', '#90b8d8');
+    const img = await fileToImage(file);
+    const { w, h } = img;
+
+    const totals     = { inf: 0, cav: 0, arc: 0 };
+    const bestByType = { inf: null, cav: null, arc: null };
+
+    // Two-column OCR: left [2%-52%] and right [48%-98%]
+    for (const [x0p, x1p] of [[0.02, 0.52], [0.48, 0.98]]) {
+      const x0=Math.round(w*x0p), x1=Math.round(w*x1p);
+      const y0=Math.round(h*0.18), y1=Math.round(h*0.90);
+      const cw=x1-x0, ch=y1-y0;
+      const cv = document.createElement('canvas');
+      cv.width = cw*2; cv.height = ch*2;
+      const ctx = cv.getContext('2d');
+      ctx.scale(2,2);
+      ctx.drawImage(img.el, x0, y0, cw, ch, 0, 0, cw, ch);
+      const id2 = ctx.getImageData(0, 0, cv.width, cv.height);
+      const d2 = id2.data;
+      for (let k = 0; k < d2.length; k+=4) {
+        const bw = (d2[k]+d2[k+1]+d2[k+2]) < 380 ? 0 : 255;
+        d2[k]=d2[k+1]=d2[k+2]=bw;
+      }
+      ctx.putImageData(id2, 0, 0);
+      const { data: { text } } = await worker.recognize(cv);
+      parseTroopColumn(text, totals, bestByType);
+    }
+
+    // Find overall best tier
+    let bestTier = 0;
+    for (const bt of Object.values(bestByType)) {
+      if (bt && bt.tier > bestTier) bestTier = bt.tier;
+    }
+
+    // TG badge detection (only for T10 Apex troops)
+    let tgLevel = 0;
+    if (bestTier >= 10) {
+      setStatus('🔍 Detecting TG level…', '#90b8d8');
+      const candidates = detectTGBadgeCandidates(img.el, w, h);
+      const votes = [];
+      for (const badge of candidates.slice(0, 8)) {
+        const pad = Math.max(badge.w, badge.h) * 0.9;
+        const bx0=Math.round(badge.cx-pad), by0=Math.round(badge.cy-pad);
+        const bx1=Math.round(badge.cx+pad), by1=Math.round(badge.cy+pad);
+        const bw2=bx1-bx0, bh2=by1-by0;
+        if (bw2 < 4 || bh2 < 4) continue;
+        const bc = document.createElement('canvas');
+        bc.width=bw2*8; bc.height=bh2*8;
+        const bctx = bc.getContext('2d');
+        bctx.scale(8,8);
+        bctx.drawImage(img.el, bx0, by0, bw2, bh2, 0, 0, bw2, bh2);
+        const bid = bctx.getImageData(0, 0, bc.width, bc.height);
+        const bd = bid.data;
+        for (let k = 0; k < bd.length; k+=4) {
+          const isWhite = bd[k]>200 && bd[k+1]>185 && bd[k+2]>160;
+          const v = isWhite ? 0 : 255;
+          bd[k]=bd[k+1]=bd[k+2]=v;
+        }
+        bctx.putImageData(bid, 0, 0);
+        const { data: { text: bt } } = await worker.recognize(bc,
+          { tessedit_char_whitelist: '12345', tessedit_pageseg_mode: '10' });
+        const digit = bt.trim().replace(/\D/g,'');
+        if (digit >= '1' && digit <= '5') votes.push(parseInt(digit));
+      }
+      if (votes.length > 0) {
+        const freq = {};
+        votes.forEach(v => freq[v] = (freq[v]||0)+1);
+        tgLevel = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0]);
+      }
+    }
+
+    const selectVal = tierToSelectValue(bestTier, tgLevel);
+    return { ...totals, bestTier, tgLevel, selectVal };
   }
 
   // ── Field fill + flash ────────────────────────────────────
@@ -294,42 +424,40 @@
   // ── Build upload bar ──────────────────────────────────────
   function makeBar(btnLabel, inputId, onFile) {
     const wrap = document.createElement('div');
-    // Outer wrapper: column layout — button row on top, status text below
+    // Outer wrapper: centered column — button centered, status text centered below
     wrap.style.cssText = [
       'width:100%','box-sizing:border-box',
-      'display:flex','flex-direction:column','gap:6px',
-      'padding:8px 12px','margin-bottom:10px',
+      'display:flex','flex-direction:column','align-items:center','gap:8px',
+      'padding:12px 16px','margin-bottom:10px',
       'background:#0d1520','border:1px solid #2a3850','border-radius:8px',
     ].join(';');
-
-    // Top row: just the button
-    const topRow = document.createElement('div');
-    topRow.style.cssText = 'display:flex;align-items:center;gap:10px;';
 
     const lbl = document.createElement('label');
     lbl.htmlFor = inputId;
     lbl.style.cssText = [
-      'display:inline-flex','align-items:center','gap:6px',
-      'padding:6px 14px','background:#1a2c44',
-      'border:1px solid #3a5878','border-radius:6px',
-      'color:#90b8d8','font-size:13px','font-weight:600',
-      'cursor:pointer','white-space:nowrap','flex-shrink:0',
-      'transition:background .15s,border-color .15s',
+      'display:inline-flex','align-items:center','justify-content:center','gap:7px',
+      'padding:8px 20px','background:#1a2c44',
+      'border:1px solid #3a5878','border-radius:8px',
+      'color:#90b8d8','font-size:14px','font-weight:600',
+      'cursor:pointer','white-space:nowrap',
+      'transition:background .15s,border-color .15s,color .15s',
     ].join(';');
     lbl.textContent = btnLabel;
-    lbl.addEventListener('mouseenter', () => { lbl.style.background='#243a58'; lbl.style.borderColor='#5a90c0'; });
-    lbl.addEventListener('mouseleave', () => { lbl.style.background='#1a2c44'; lbl.style.borderColor='#3a5878'; });
+    lbl.addEventListener('mouseenter', () => { lbl.style.background='#243a58'; lbl.style.borderColor='#5a90c0'; lbl.style.color='#c0d8f0'; });
+    lbl.addEventListener('mouseleave', () => { lbl.style.background='#1a2c44'; lbl.style.borderColor='#3a5878'; lbl.style.color='#90b8d8'; });
 
     const inp = document.createElement('input');
     inp.type = 'file'; inp.id = inputId; inp.accept = 'image/*'; inp.style.display = 'none';
 
-    topRow.appendChild(lbl);
-    topRow.appendChild(inp);
-
-    // Status line below the button — full width, wraps freely
+    // Status line — centered, full width, wraps freely
     const status = document.createElement('div');
-    status.style.cssText = 'font-size:12px;color:#4a6080;width:100%;box-sizing:border-box;word-break:break-word;line-height:1.4;min-height:1.2em;';
-    status.textContent = 'Tap to upload screenshot — processed locally, no data sent anywhere';
+    status.style.cssText = [
+      'font-size:12px','color:#4a6080',
+      'width:100%','box-sizing:border-box',
+      'text-align:center','word-break:break-word',
+      'line-height:1.5','min-height:1.3em',
+    ].join(';');
+    status.textContent = 'Processed locally — no data sent anywhere';
 
     function setStatus(msg, color) { status.textContent = msg; status.style.color = color || '#4a6080'; }
 
@@ -347,7 +475,8 @@
       }
     });
 
-    wrap.appendChild(topRow);
+    wrap.appendChild(lbl);
+    wrap.appendChild(inp);
     wrap.appendChild(status);
     return wrap;
   }
@@ -404,8 +533,27 @@
       setField('stockCav', Math.round(troops.cav));
       setField('stockArc', Math.round(troops.arc));
 
+      // Auto-set troop tier select if detected
+      if (troops.selectVal) {
+        const sel = document.getElementById('troopTier');
+        if (sel) {
+          const opt = [...sel.options].find(o => o.value === troops.selectVal);
+          if (opt) {
+            sel.value = troops.selectVal;
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            sel.style.outline = '2px solid #4caf88';
+            sel.style.boxShadow = '0 0 6px #4caf8866';
+            sel.style.background = '#1a3528';
+            setTimeout(() => { sel.style.outline=''; sel.style.boxShadow=''; sel.style.background=''; }, 1600);
+          }
+        }
+      }
+
       const fmt = n => Number(n).toLocaleString();
-      setStatus(`✅ INF ${fmt(troops.inf)}  CAV ${fmt(troops.cav)}  ARC ${fmt(troops.arc)}`, '#4caf88');
+      const tierStr = troops.bestTier > 0
+        ? (troops.tgLevel > 0 ? ` \u00b7 \ud83c\udf96 ${troops.selectVal} detected` : ` \u00b7 Tier \u2192 ${troops.selectVal}`)
+        : '';
+      setStatus(`\u2705 INF ${fmt(troops.inf)}  CAV ${fmt(troops.cav)}  ARC ${fmt(troops.arc)}${tierStr}`, '#4caf88');
 
       if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
       if (window.Magic?.compute)      setTimeout(() => window.Magic.compute('magic12'), 200);
