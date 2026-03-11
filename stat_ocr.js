@@ -118,29 +118,40 @@
   }
 
   // ══════════════════════════════════════════════════════════
-  // STATS ENGINE  (v8 – color-based green exclusion)
+  // STATS ENGINE  (v9 – dual-column OCR, arrow-proof)
   // ══════════════════════════════════════════════════════════
   //
-  // Layout in every Bonus Details format:
-  //   [RED +420.0%]  [Infantry Attack]  [GREEN +660.0%]
+  // Root cause of all previous failures:
+  //   The Cavalry Attack row has << >> navigation arrows flanking it.
+  //   These arrows corrupt Tesseract's OCR of the +412.7% value on that line
+  //   in unpredictable ways ('<< 1412.7%', 'cc 412.7%', '+80.9%' etc.)
+  //   No amount of regex patching is reliable across Tesseract versions.
   //
-  // FIX: Instead of a fixed x-crop (which failed for wider images like
-  // emmo-stats), we use COLOR FILTERING to build the B&W canvas:
-  //   • Red pixels   (R>G+60, R>B+60, sum<500) → BLACK  ✓ keep (left values)
-  //   • Black pixels (all channels low, sum<300) → BLACK  ✓ keep (stat names)
-  //   • Green pixels (G>R, G>B, G>120)          → WHITE  ✗ exclude (right values)
-  //   • Beige/bg pixels (sum>500)               → WHITE  ✗ exclude
+  // The fix: split the OCR into TWO separate column crops.
   //
-  // This removes green +660/+550/+440 values from OCR input regardless of
-  // where they appear in the image — no fixed column boundary needed.
+  //   VALUES COLUMN  (x: 7%–33% of image width)
+  //     Contains only the red stat numbers. The nav arrows are at x≈0–6%
+  //     and x≈74–80%, so this crop entirely avoids them.
+  //     OCR with digits-only whitelist → clean numbers for all 12 rows.
+  //
+  //   NAMES COLUMN  (x: 33%–63% of image width)
+  //     Contains only the black stat labels ("Infantry Attack" etc.).
+  //     Arrow symbols and number columns are excluded entirely.
+  //     OCR gives perfectly clean stat names.
+  //
+  //   MAPPING: The Bonus Details table always has exactly 12 rows in
+  //   canonical order. When we get exactly 12 values from the values
+  //   column, we map them directly by position to STAT_ROW_KEYS.
+  //   If OCR misses some rows, we fall back to keyword matching in the
+  //   names column paired with the corresponding value by row index.
 
-  function isStatTextPixel(r, g, b) {
-    // Exclude green text (the right-column bonus values)
-    const isGreen = g > r && g > b && g > 120 && r < 140;
-    if (isGreen) return false;
-    // Include dark/red pixels (left stat values + center black labels)
-    return (r + g + b) < 500;
-  }
+  // Canonical 12-row order of the Bonus Details table
+  const STAT_ROW_KEYS = [
+    'inf_atk', 'inf_def', 'inf_let', 'inf_hp',
+    'cav_atk', 'cav_def', 'cav_let', 'cav_hp',
+    'arc_atk', 'arc_def', 'arc_let', 'arc_hp',
+  ];
+  const STAT_TARGETS = new Set(['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let']);
 
   const STAT_KEYWORDS = {
     inf_atk: /infantry.{0,12}attack/i,
@@ -151,64 +162,62 @@
     arc_let: /archer.{0,12}lethality/i,
   };
 
-  /**
-   * Extract a stat value from a single text line.
-   *
-   * Handles all Tesseract output artifacts observed on real screenshots:
-   *
-   * 1. Standard:    "+412.7% Cavalry Attack"         → 412.7
-   * 2. Comma dec:   "+412,7%"                        → 412.7
-   * 3. Garbled '+': "<< 1412.7% Cavalry Attack »"
-   *                 The left nav arrow causes Tesseract to OCR '+' as '1',
-   *                 giving "1412.7". Detected by value ≥ 1000 (no real game
-   *                 stat exceeds 999.9%), then leading digit is stripped.
-   * 4. Arrow as letters: "cc 1412.7% Cavalry Attack" — Tesseract.js (browser)
-   *                 may render '<<' as 'cc', 'ce', or similar letter pairs.
-   * 5. Decimal dropped: "+4515%" → 451.5 (4 raw digits → NNN.N)
-   *
-   * Strategy: skip ALL leading non-digit/non-plus characters (handles any
-   * arrow rendering variant), then match the first number from that position.
-   */
-  function parseStatValue(line) {
-    // Advance past any leading noise to the first '+' or digit
-    const start = line.search(/[+\d]/);
-    if (start < 0) return null;
-    const s = line.slice(start);
-
-    // Primary: +NNN.N or NNN.N (with or without + prefix)
+  /** Parse a stat value (100–999.9) from a short text token. */
+  function parseStatNumber(s) {
+    s = (s || '').trim();
     let m = s.match(/^\+?(\d{1,4})[.,](\d)/);
     if (m) {
-      let val = parseFloat(`${m[1]}.${m[2]}`);
-      // ≥ 1000 means the leading digit is a garbled '+' — strip it
-      if (val >= 1000 && m[1].length === 4) val = parseFloat(`${m[1].slice(1)}.${m[2]}`);
-      if (val >= 100 && val < 1000) return val;
+      let v = parseFloat(`${m[1]}.${m[2]}`);
+      // ≥1000 means leading digit is a garbled '+' (e.g. '1412.7' → 412.7)
+      if (v >= 1000 && m[1].length === 4) v = parseFloat(`${m[1].slice(1)}.${m[2]}`);
+      if (v >= 100 && v < 1000) return v;
     }
-
-    // Fallback: decimal dropped by OCR — 4 raw digits treated as NNN.N
+    // Decimal dropped: 4 raw digits → NNN.N  (e.g. '4515' → 451.5)
     m = s.match(/^\+?(\d{3})(\d)(?!\d)/);
     if (m) {
-      const val = parseFloat(`${m[1]}.${m[2]}`);
-      if (val >= 100 && val < 1000) return val;
+      const v = parseFloat(`${m[1]}.${m[2]}`);
+      if (v >= 100 && v < 1000) return v;
     }
-
     return null;
   }
 
-  function parseStatsFromText(text) {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    const results = {};
+  /**
+   * Extract 12 stat values (one per table row) from the VALUES column OCR text.
+   * Lines that don't contain a valid stat value (header noise, blank lines) are
+   * skipped. Returns an array of up to 12 numbers in canonical row order.
+   */
+  function extractStatValues(text) {
+    const vals = [];
+    for (const line of text.split('\n')) {
+      const v = parseStatNumber(line.trim());
+      if (v !== null) vals.push(v);
+      if (vals.length === 12) break;
+    }
+    return vals;
+  }
 
+  /**
+   * Extract stat results from the NAMES column OCR text, paired with
+   * a values array by matching row index in STAT_ROW_KEYS.
+   * Used when values array length is not exactly 12.
+   */
+  function matchNamesToCols(namesText, vals) {
+    const results = {};
+    const lines = namesText.split('\n').map(l => l.trim()).filter(Boolean);
+    // Find which name-lines match stat keywords, in the order they appear
+    const nameOrder = []; // [{key, rowIdx}]
     for (const line of lines) {
       for (const [key, re] of Object.entries(STAT_KEYWORDS)) {
-        if (key in results || !re.test(line)) continue;
-        // Both keyword AND value must be on the same line.
-        // parseStatValue handles the arrow-noise case where Tesseract
-        // drops the decimal separator ("+4127%" → 412.7).
-        // Never look at adjacent lines — they belong to different stat rows
-        // and would cause wrong values to be grabbed (e.g. Infantry Health
-        // appearing just above the Cavalry Attack row).
-        const val = parseStatValue(line);
-        if (val !== null) results[key] = val;
+        if (nameOrder.find(n => n.key === key)) continue;
+        if (re.test(line)) {
+          const rowIdx = STAT_ROW_KEYS.indexOf(key);
+          if (rowIdx >= 0) nameOrder.push({ key, rowIdx });
+        }
+      }
+    }
+    for (const { key, rowIdx } of nameOrder) {
+      if (rowIdx < vals.length && STAT_TARGETS.has(key)) {
+        results[key] = vals[rowIdx];
       }
     }
     return results;
@@ -219,18 +228,49 @@
     const img = await fileToImage(file);
     setStatus('🔍 Reading stats…', '#a0b4d0');
 
-    // Scan the full image with color filtering:
-    //   • Red pixels  (left stat values: +420.0% etc)  → kept as black
-    //   • Black pixels (center stat labels)             → kept as black
-    //   • Green pixels (right bonus column: +660% etc)  → excluded (white)
-    //   • Beige/bg                                      → excluded (white)
-    // This works for ALL screenshot formats — Mail popup, Battle Report tab,
-    // portrait or landscape — with no geometry assumptions.
-    // 3× upscale ensures readable text even on small/thumbnail screenshots.
-    const bw = buildBWCanvas(img, 0, 0, 1, 1, isStatTextPixel, 3);
-    const text = await runOCR(bw, 6, null);
-    return parseStatsFromText(text);
+    // ── VALUES COLUMN: x 7%–33%, full height ─────────────────
+    // This region contains only the red stat numbers.
+    // Nav arrows (<< >>) are at the far left/right edges and are excluded.
+    // Digits-only whitelist prevents letter-noise from garbling numbers.
+    const isDarkPixel = (r, g, b) => (r + g + b) < 500;
+    const valsBW = buildBWCanvas(img, 0.07, 0, 0.33, 1, isDarkPixel, 3);
+    const valsText = await runOCR(valsBW, 6, '0123456789+.,');
+    const vals = extractStatValues(valsText);
+
+    // ── NAMES COLUMN: x 33%–63%, full height ─────────────────
+    // This region contains only the black stat label text.
+    // Completely avoids both the value numbers and the nav arrows.
+    const namesBW = buildBWCanvas(img, 0.33, 0, 0.63, 1, isDarkPixel, 3);
+    const namesText = await runOCR(namesBW, 6, null);
+
+    // ── MAP VALUES TO STAT KEYS ───────────────────────────────
+    let results = {};
+
+    if (vals.length === 12) {
+      // Perfect: 12 values → direct position mapping to STAT_ROW_KEYS
+      for (let i = 0; i < 12; i++) {
+        const key = STAT_ROW_KEYS[i];
+        if (STAT_TARGETS.has(key)) results[key] = vals[i];
+      }
+    } else {
+      // Fallback: match names to values by row index
+      results = matchNamesToCols(namesText, vals);
+    }
+
+    // ── SANITY: fill any gaps using names+values together ─────
+    // If still missing any target stats, try scanning the names text and
+    // pairing each found keyword with the value at the matching row index.
+    for (const [key, re] of Object.entries(STAT_KEYWORDS)) {
+      if (results[key] != null) continue;
+      if (re.test(namesText)) {
+        const rowIdx = STAT_ROW_KEYS.indexOf(key);
+        if (rowIdx >= 0 && rowIdx < vals.length) results[key] = vals[rowIdx];
+      }
+    }
+
+    return results;
   }
+
 
   // ══════════════════════════════════════════════════════════
   // TROOPS ENGINE  (v8 – single-pass + correct TG detection)
