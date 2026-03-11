@@ -328,10 +328,7 @@
 
   // ── Main troop extraction ─────────────────────────────────
   async function extractTroops(file, setStatus) {
-    setStatus('⏳ Loading OCR engine…', '#90b8d8');
-    const worker = await getWorker();
-
-    setStatus('🔍 Reading troop columns…', '#90b8d8');
+    setStatus('⏳ Loading image…', '#90b8d8');
     const img = await fileToImage(file);
     const { w, h } = img;
 
@@ -340,22 +337,10 @@
 
     // Two-column OCR: left [2%-52%] and right [48%-98%]
     for (const [x0p, x1p] of [[0.02, 0.52], [0.48, 0.98]]) {
-      const x0=Math.round(w*x0p), x1=Math.round(w*x1p);
-      const y0=Math.round(h*0.18), y1=Math.round(h*0.90);
-      const cw=x1-x0, ch=y1-y0;
-      const cv = document.createElement('canvas');
-      cv.width = cw*2; cv.height = ch*2;
-      const ctx = cv.getContext('2d');
-      ctx.scale(2,2);
-      ctx.drawImage(img.el, x0, y0, cw, ch, 0, 0, cw, ch);
-      const id2 = ctx.getImageData(0, 0, cv.width, cv.height);
-      const d2 = id2.data;
-      for (let k = 0; k < d2.length; k+=4) {
-        const bw = (d2[k]+d2[k+1]+d2[k+2]) < 380 ? 0 : 255;
-        d2[k]=d2[k+1]=d2[k+2]=bw;
-      }
-      ctx.putImageData(id2, 0, 0);
-      const { data: { text } } = await worker.recognize(cv);
+      setStatus('🔍 Reading troop columns…', '#90b8d8');
+      const bw = buildBWCanvas(img, x0p, 0.18, x1p, 0.90,
+        (r, g, b) => (r + g + b) < 380, 2);
+      const text = await runOCR(bw, '--psm 6', null);
       parseTroopColumn(text, totals, bestByType);
     }
 
@@ -377,6 +362,8 @@
         const bx1=Math.round(badge.cx+pad), by1=Math.round(badge.cy+pad);
         const bw2=bx1-bx0, bh2=by1-by0;
         if (bw2 < 4 || bh2 < 4) continue;
+
+        // Crop badge area from original image, isolate white digit on gold
         const bc = document.createElement('canvas');
         bc.width=bw2*8; bc.height=bh2*8;
         const bctx = bc.getContext('2d');
@@ -390,9 +377,8 @@
           bd[k]=bd[k+1]=bd[k+2]=v;
         }
         bctx.putImageData(bid, 0, 0);
-        const { data: { text: bt } } = await worker.recognize(bc,
-          { tessedit_char_whitelist: '12345', tessedit_pageseg_mode: '10' });
-        const digit = bt.trim().replace(/\D/g,'');
+        const badgeText = await runOCR(bc, '--psm 10 -c tessedit_char_whitelist=12345', null);
+        const digit = badgeText.trim().replace(/\D/g,'');
         if (digit >= '1' && digit <= '5') votes.push(parseInt(digit));
       }
       if (votes.length > 0) {
