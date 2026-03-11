@@ -153,22 +153,43 @@
 
   /**
    * Extract a stat value from a single text line.
-   * Handles:
-   *   +412.7%  → 412.7  (standard with dot)
-   *   +412,7%  → 412.7  (comma decimal, some locales)
-   *   +4127%   → 412.7  (OCR dropped decimal — 4 digits → NNN.N)
-   * The decimal-drop case happens when navigation arrow characters
-   * (< >) near the Cavalry Attack row create pixel noise that causes
-   * Tesseract to lose the period between "412" and "7".
+   *
+   * Handles the actual Tesseract output artifacts observed on real screenshots:
+   *
+   * 1. Standard:   "+412.7% Cavalry Attack"    → 412.7
+   * 2. Comma dec:  "+412,7%"                   → 412.7
+   * 3. Garbled '+': "<< 1412.7% Cavalry Attack —-+80.9% »"
+   *                The left nav arrow causes Tesseract to OCR '+' as '1',
+   *                giving "1412.7" instead of "+412.7". Detected by value ≥ 1000
+   *                (all real game stats are 100–999.9), then strip leading digit.
+   * 4. Decimal dropped: "+4515%" → 451.5 (4 raw digits → NNN.N)
+   *
+   * Always strips leading pipe/arrow/bracket noise before matching,
+   * and only matches the LEFTMOST number on the line (stat value is
+   * always left of the stat name; right-column green values are ignored).
    */
   function parseStatValue(line) {
-    // Standard: +NNN.N or +NNN,N
-    let m = line.match(/\+(\d{2,4})[.,](\d)/);
-    if (m) return parseFloat(`${m[1]}.${m[2]}`);
-    // Fallback: 4 digits with no separator (OCR dropped decimal)
-    // e.g. "+4127" → 412.7  "+3181" → 318.1
-    m = line.match(/\+(\d{3})(\d)(?!\d)/);
-    if (m) return parseFloat(`${m[1]}.${m[2]}`);
+    // Strip leading noise chars (|, <, >, «, », !, spaces)
+    const s = line.replace(/^[\s|!<>«»]+/, '');
+
+    // Primary: match first number (with optional + prefix) + decimal
+    let m = s.match(/^\+?(\d{1,4})[.,](\d)/);
+    if (m) {
+      let val = parseFloat(`${m[1]}.${m[2]}`);
+      // If ≥ 1000, leading digit is a garbled '+' (e.g. "1412.7" → 412.7)
+      if (val >= 1000 && m[1].length === 4) {
+        val = parseFloat(`${m[1].slice(1)}.${m[2]}`);
+      }
+      if (val >= 100 && val < 1000) return val;
+    }
+
+    // Fallback: decimal dropped by OCR — 4 raw digits = NNN.N
+    m = s.match(/^\+?(\d{3})(\d)(?!\d)/);
+    if (m) {
+      const val = parseFloat(`${m[1]}.${m[2]}`);
+      if (val >= 100 && val < 1000) return val;
+    }
+
     return null;
   }
 
