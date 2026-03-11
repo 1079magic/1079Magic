@@ -151,15 +151,44 @@
     arc_let: /archer.{0,12}lethality/i,
   };
 
+  /**
+   * Extract a stat value from a single text line.
+   * Handles:
+   *   +412.7%  → 412.7  (standard with dot)
+   *   +412,7%  → 412.7  (comma decimal, some locales)
+   *   +4127%   → 412.7  (OCR dropped decimal — 4 digits → NNN.N)
+   * The decimal-drop case happens when navigation arrow characters
+   * (< >) near the Cavalry Attack row create pixel noise that causes
+   * Tesseract to lose the period between "412" and "7".
+   */
+  function parseStatValue(line) {
+    // Standard: +NNN.N or +NNN,N
+    let m = line.match(/\+(\d{2,4})[.,](\d)/);
+    if (m) return parseFloat(`${m[1]}.${m[2]}`);
+    // Fallback: 4 digits with no separator (OCR dropped decimal)
+    // e.g. "+4127" → 412.7  "+3181" → 318.1
+    m = line.match(/\+(\d{3})(\d)(?!\d)/);
+    if (m) return parseFloat(`${m[1]}.${m[2]}`);
+    return null;
+  }
+
   function parseStatsFromText(text) {
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
     const results = {};
-    for (const line of text.split('\n')) {
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       for (const [key, re] of Object.entries(STAT_KEYWORDS)) {
         if (key in results) continue;
         if (!re.test(line)) continue;
-        // Grab the FIRST +NNN.N% on this line (always the red left value)
-        const m = line.match(/\+(\d{2,4})[.,](\d)/);
-        if (m) results[key] = parseFloat(`${m[1]}.${m[2]}`);
+
+        // Keyword found — look for value on this line, then prev/next line.
+        // Split-line case occurs when navigation arrows (< >) on the
+        // Cavalry Attack row cause Tesseract to break the line in two.
+        let val = parseStatValue(line);
+        if (val === null && i > 0)                val = parseStatValue(lines[i - 1]);
+        if (val === null && i < lines.length - 1) val = parseStatValue(lines[i + 1]);
+        if (val !== null) results[key] = val;
       }
     }
     return results;
