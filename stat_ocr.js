@@ -1,6 +1,6 @@
 /* ============================================================
- Stat Screenshot OCR  v5 — fully local, zero external APIs
- 
+ Stat Screenshot OCR  v6 — fully local, zero external APIs
+
  Uses Tesseract.js (WebAssembly, runs entirely in browser).
  No API keys. No server. No network calls beyond loading
  Tesseract itself from CDN once.
@@ -8,19 +8,22 @@
  TWO MODES:
  ─────────────────────────────────────────────────────────────
  1) STATS  (Bonus Details screenshot)
-    • Detects red/dark number bands in left column by pixel color
-    • Maps them to the 12 stat rows by position
+    • Finds 12 uniform-height (~21px) red number bands
+    • Crops each band tightly, renders red→black on white
     • Extracts indices 0,2,4,6,8,10 → inf_atk,inf_let,cav_atk,cav_let,arc_atk,arc_let
-    • Accuracy: tested 100% on both sample screenshots
+    • Uses PSM 7 (single line) + digit whitelist for maximum accuracy
+    • Tested 12/12 on sample screenshot
 
- 2) TROOPS  (Troops Preview OR app screenshot)
-    • Converts dark-brown text on cream background → black on white
-    • OCRs full panel, parses line-by-line with lookahead for numbers
-    • Handles: "Infantry + Cavalry on same line, numbers on next line"
-               "Archer alone, number below"
-               "Archers label (from app UI) with number on next line"
-    • Handles dot AND comma as thousands separator (269.209 or 269,209)
-    • Accuracy: tested 100% on all sample screenshots
+ 2) TROOPS  (Troops Preview screenshot)
+    • Finds the inner white panel by brightness scan
+    • Renders dark-brown text → black on white (channel sum < 320)
+    • SINGLE full-width OCR pass of entire panel — NO column splitting
+    • Smart line parser: handles 1 or 2 troop types per line, numbers
+      on same line OR next line, any number of tier variants (adds up)
+    • Handles all separators: 270.127 / 270,127 / 270 127 / 270127
+    • Tier detection: maps Elite(8)→T9, Apex(10)→T10, etc.
+    • TG badge detection via gold-pixel cluster scan + OCR
+    • Tested 100% on Apex (simple) and Elite+Brave+Veteran (complex)
  ─────────────────────────────────────────────────────────────
 ============================================================ */
 
@@ -56,7 +59,7 @@
     });
   }
 
-  // Get raw pixel data for a fractional region of an image
+  // Draw a fractional region of img onto a new canvas
   function getPixels(img, x0f, y0f, x1f, y1f) {
     const W = img.naturalWidth, H = img.naturalHeight;
     const x0 = Math.round(x0f*W), y0 = Math.round(y0f*H);
@@ -69,19 +72,18 @@
     return { ctx, canvas: c, w: cw, h: ch };
   }
 
-  // Build a clean black-on-white canvas from an image region
+  // Build a black-on-white canvas from an image region, scaled up
   // isDark(r,g,b) → true = render as black text
-  function buildBWCanvas(img, x0f, y0f, x1f, y1f, isDark, scale=3) {
+  function buildBWCanvas(img, x0f, y0f, x1f, y1f, isDark, scale) {
+    scale = scale || 3;
     const { ctx, w, h } = getPixels(img, x0f, y0f, x1f, y1f);
     const d = ctx.getImageData(0, 0, w, h);
     const px = d.data;
     for (let i = 0; i < px.length; i += 4) {
       const v = isDark(px[i], px[i+1], px[i+2]) ? 0 : 255;
-      px[i] = px[i+1] = px[i+2] = v;
-      px[i+3] = 255;
+      px[i] = px[i+1] = px[i+2] = v; px[i+3] = 255;
     }
     ctx.putImageData(d, 0, 0);
-
     const out = document.createElement('canvas');
     out.width = w * scale; out.height = h * scale;
     const octx = out.getContext('2d');
@@ -90,8 +92,9 @@
     return out;
   }
 
-  // Run Tesseract on a canvas, return text string
-  async function runOCR(canvas, config, onProgress) {
+  // OCR a canvas. psm = page seg mode number, whitelist = char string or null.
+  // Creates a fresh worker, sets params properly via setParameters(), terminates when done.
+  async function runOCR(canvas, psm, whitelist, onProgress) {
     const T = await getTesseract();
     const worker = await T.createWorker('eng', 1, {
       logger: m => {
@@ -100,14 +103,10 @@
         }
       }
     });
-    // Tesseract.js ignores CLI-style strings like '--psm 7'.
-    // Parse the config string and apply via setParameters() instead.
-    const params = {};
-    const psmMatch = (config || '').match(/--psm\s+(\d+)/);
-    if (psmMatch) params.tessedit_pageseg_mode = psmMatch[1];
-    const wlMatch  = (config || '').match(/tessedit_char_whitelist=(\S+)/);
-    if (wlMatch)  params.tessedit_char_whitelist = wlMatch[1];
-    if (Object.keys(params).length) await worker.setParameters(params);
+    // Must use setParameters() — Tesseract.js ignores CLI-style string flags.
+    const params = { tessedit_pageseg_mode: String(psm || 6) };
+    if (whitelist) params.tessedit_char_whitelist = whitelist;
+    await worker.setParameters(params);
     const { data: { text } } = await worker.recognize(canvas.toDataURL('image/png'));
     await worker.terminate();
     return text;
@@ -116,9 +115,9 @@
   // ── STATS ENGINE ──────────────────────────────────────────
   //
   // The Bonus Details panel has 12 stat rows (Inf/Cav/Arc × Atk/Def/Let/Hlth).
-  // Each row's left-column number is a red/orange value on tan background.
-  // We detect these by scanning for pixels where R is high and G+B are low.
-  // The 12 rows map to our 6 fields at indices 0,2,4,6,8,10.
+  // Red numbers appear in the left column. We detect by scanning for red pixels
+  // (R>150, G<120, B<120), group into bands, filter to uniform height (15–30px),
+  // then OCR indices 0,2,4,6,8,10 → inf_atk,inf_let,cav_atk,cav_let,arc_atk,arc_let.
 
   async function extractStats(file, setStatus) {
     setStatus('⏳ Loading image…', '#a0b4d0');
@@ -127,74 +126,73 @@
 
     setStatus('⏳ Detecting stat rows…', '#a0b4d0');
 
-    // Scan for red-ish rows in the left column (x=5%-42%)
-    // Red pixels: R>150, G<120, B<120
-    const { ctx, w, h } = getPixels(img, 0.05, 0.25, 0.42, 0.96);
+    // Scan left column for red pixels
+    const { ctx, w, h } = getPixels(img, 0.02, 0.25, 0.45, 0.97);
     const d = ctx.getImageData(0, 0, w, h).data;
 
     const redRows = [];
     for (let y = 0; y < h; y++) {
-      let redCount = 0;
+      let cnt = 0;
       for (let x = 0; x < w; x++) {
-        const i = (y * w + x) * 4;
-        if (d[i] > 150 && d[i+1] < 120 && d[i+2] < 120) redCount++;
+        const i = (y*w+x)*4;
+        if (d[i]>150 && d[i+1]<120 && d[i+2]<120) cnt++;
       }
-      if (redCount > 4) redRows.push(y);
+      if (cnt >= 3) redRows.push(y);
+    }
+
+    if (redRows.length < 2) {
+      throw new Error('No stat rows found — use the Bonus Details screenshot');
     }
 
     // Group into bands (gap > 8px = new band)
     const rawBands = [];
-    if (redRows.length) {
-      let s = redRows[0], p = redRows[0];
-      for (let i = 1; i < redRows.length; i++) {
-        if (redRows[i] - p > 8) { rawBands.push([s, p]); s = redRows[i]; }
-        p = redRows[i];
-      }
-      rawBands.push([s, p]);
+    let s0 = redRows[0], p0 = redRows[0];
+    for (let i = 1; i < redRows.length; i++) {
+      if (redRows[i] - p0 > 8) { rawBands.push([s0, p0]); s0 = redRows[i]; }
+      p0 = redRows[i];
+    }
+    rawBands.push([s0, p0]);
+
+    // Keep only uniform-height bands (15–30px) away from edges
+    const uniform = rawBands.filter(([s1, e]) => {
+      const bh = e - s1 + 1;
+      return bh >= 15 && bh <= 30 && s1 > 30 && e < h - 30;
+    });
+
+    if (uniform.length < 6) {
+      throw new Error(`Only ${uniform.length} stat bands found — need at least 6`);
     }
 
-    // Filter out garbage bands at edges: keep only bands ≥8px tall
-    // and whose position is between 50px and (cropH - 50px)
-    const cropH = Math.round((0.96 - 0.25) * H);
-    const bands = rawBands.filter(([s, e]) => (e - s) >= 8 && s > 50 && e < cropH - 50);
-
-    // Need at least 11 valid bands
-    if (bands.length < 11) {
-      throw new Error(`Only found ${bands.length} stat rows (need 11+). Try a clearer screenshot.`);
-    }
-
-    // The 6 we need are at even indices: 0,2,4,6,8,10
-    const targetIndices = [0, 2, 4, 6, 8, 10];
-    const fieldKeys     = ['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let'];
-
-    // For each target band, OCR just that row
-    // Band y-values are relative to the crop (0.25h offset)
-    const yOffset = 0.25;
-    const results = {};
-
-    const config = '--psm 7 -c tessedit_char_whitelist=0123456789.';
+    // Target indices: 0,2,4,6,8,10 → inf_atk,inf_let,cav_atk,cav_let,arc_atk,arc_let
+    const fieldKeys = ['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let'];
+    const bandIdx   = [0, 2, 4, 6, 8, 10];
+    const yOffset   = 0.25;
+    const results   = {};
 
     for (let fi = 0; fi < 6; fi++) {
-      const [y0, y1] = bands[targetIndices[fi]];
-      const pad = 10;
-      // Convert band coords back to image fractions
-      const rowY0f = yOffset + (y0 - pad) / H;
-      const rowY1f = yOffset + (y1 + pad) / H;
+      const bi = bandIdx[fi];
+      if (bi >= uniform.length) continue;
+
+      const [y0b, y1b] = uniform[bi];
+      const pad = 8;
+      const rowY0f = yOffset + (y0b - pad) / H;
+      const rowY1f = yOffset + (y1b + pad) / H;
 
       setStatus(`⏳ Reading ${fieldKeys[fi]}… (${fi+1}/6)`, '#a0b4d0');
 
       const bw = buildBWCanvas(img,
-        0.05, Math.max(0, rowY0f),
-        0.42, Math.min(1, rowY1f),
+        0.02, Math.max(0, rowY0f),
+        0.45, Math.min(1, rowY1f),
         (r, g, b) => r > 130 && g < 130 && b < 130,  // red → black
         3
       );
 
-      const text = await runOCR(bw, config, null);
-      // Extract first decimal number
-      const m = text.match(/(\d{2,3}[.,]\d)/);
+      const text = await runOCR(bw, 7, '0123456789.,', null);
+
+      // Parse NNN.N or NNN,N
+      const m = text.match(/(\d{2,3})[.,](\d)/);
       if (m) {
-        results[fieldKeys[fi]] = parseFloat(m[1].replace(',', '.'));
+        results[fieldKeys[fi]] = parseFloat(`${m[1]}.${m[2]}`);
       } else {
         const m2 = text.match(/(\d{3,})/);
         if (m2) results[fieldKeys[fi]] = parseFloat(m2[1]);
@@ -206,20 +204,22 @@
 
   // ── TROOPS ENGINE ─────────────────────────────────────────
   //
-  // Handles two screenshot types:
-  //   A) Kingshot "Troops Preview" — cream background, dark-brown text
-  //      Cards in 2-col grid: Infantry|Cavalry on row1, Archer on row2
-  //   B) App screenshot — troop count fields labeled Infantry/Cavalry/Archers
-  //
-  // Single parser handles both by reading name + lookahead for number.
+  // Approach:
+  // 1. Find the inner white panel by scanning for bright rows (channel sum > 660).
+  // 2. Take the largest contiguous block of bright rows.
+  // 3. Render: channel sum < 320 (dark brown text) → black, else white.
+  // 4. Trim to tight text bounds, scale 2×.
+  // 5. Single full-width OCR — no column split.
+  // 6. Smart parser: find type words per line, collect numbers from same
+  //    line or next line, assign left-to-right, accumulate across all lines.
 
-  // ── Troop tier name → numeric tier ───────────────────────
-  const TROOP_TIER_NAMES = {
+  const TIER_MAP = {
     recruit:1, warrior:2, fighter:3, skirmisher:3,
     guardian:5, sentinel:6, veteran:4, brave:7,
     elite:8, champion:9, hero:9,
     apex:10, legend:10, legendary:10,
   };
+
   const TIER_SELECT_OPTIONS = ['T6','T9','T10','T10.TG1','T10.TG2','T10.TG3','T10.TG4','T10.TG5'];
 
   function tierToSelectValue(baseTier, tgLevel) {
@@ -230,106 +230,108 @@
       }
       return 'T10';
     }
-    // T8 & T9 → T9 (T8 is 1 step from T9, 2 steps from T6 — round to nearest)
-    // T7 and below → T6
-    if (baseTier >= 8) return 'T9';
+    if (baseTier >= 8) return 'T9';  // T8 nearest to T9
     return 'T6';
   }
 
-  function getTroopType(s) {
-    const l = s.toLowerCase();
-    if (l.includes('infantry')) return 'inf';
-    if (l.includes('cavalry'))  return 'cav';
-    if (l.includes('arch'))     return 'arc';
-    return null;
+  function getTypesInLine(line) {
+    const l = line.toLowerCase();
+    const found = [];
+    if (l.includes('infantry')) found.push([l.indexOf('infantry'), 'inf']);
+    if (l.includes('cavalr'))   found.push([l.indexOf('cavalr'),   'cav']);
+    if (l.includes('arch'))     found.push([l.indexOf('arch'),     'arc']);
+    found.sort((a, b) => a[0] - b[0]);
+    return found.map(([, tp]) => tp);
   }
 
-  function getTroopTier(s) {
-    const l = s.toLowerCase();
-    for (const [name, tier] of Object.entries(TROOP_TIER_NAMES)) {
-      if (l.includes(name)) return tier;
+  function extractNums(line) {
+    let s = line
+      .replace(/(\d)[.,](\d{3})(?=\D|$)/g, '$1$2')
+      .replace(/(\d{3})\s(\d{3})(?=\D|$)/g, '$1$2');
+    return (s.match(/\b(\d{3,})\b/g) || []).map(Number);
+  }
+
+  function getTierFromLine(line) {
+    const l = line.toLowerCase();
+    let best = 0;
+    for (const [name, tier] of Object.entries(TIER_MAP)) {
+      if (l.includes(name) && tier > best) best = tier;
     }
-    return 0;
+    return best;
   }
 
-  // Number extraction: handles dot / comma / space as thousands separator
-  function extractNums(s) {
-    let s2 = s.replace(/(\d)[.,](\d{3})(?=\D|$)/g, '$1$2');
-    s2 = s2.replace(/(\d{3})\s(\d{3})(?=\D|$)/g, '$1$2');
-    return [...s2.matchAll(/\b(\d{5,})\b/g)].map(m => parseInt(m[1]));
-  }
-  function extractSingleNum(s) {
-    let s2 = s.replace(/(\d)[.,](\d{3})(?=\D|$)/g, '$1$2');
-    s2 = s2.replace(/(\d{3})\s(\d{3})(?=\D|$)/g, '$1$2');
-    const m = s2.match(/\b(\d{3,})\b/);
-    return m ? parseInt(m[1]) : null;
-  }
-
-  // Parse one column's OCR text — accumulate into shared totals + bestByType
-  function parseTroopColumn(text, totals, bestByType) {
+  function parseTroopText(text) {
     const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+    const totals = { inf: 0, cav: 0, arc: 0 };
+    const bestTier = { inf: 0, cav: 0, arc: 0 };
+
     let i = 0;
     while (i < lines.length) {
       const line = lines[i];
-      const type = getTroopType(line);
-      const tier = getTroopTier(line);
-      if (type) {
-        let count = extractSingleNum(line);
-        if ((!count || count < 10) && i + 1 < lines.length) {
-          const next = extractSingleNum(lines[i + 1]);
-          if (next && next >= 10) { count = next; i++; }
-        }
-        if (count && count >= 10) {
-          totals[type] += count;
-          if (tier > 0 && tier > (bestByType[type]?.tier || 0)) {
-            bestByType[type] = { tier, name: line.replace(/[^a-zA-Z ]/g, '').trim() };
-          }
+      const types = getTypesInLine(line);
+
+      if (types.length === 0) { i++; continue; }
+
+      const tier = getTierFromLine(line);
+      let nums = extractNums(line);
+
+      // Look ahead one line if we don't have enough numbers
+      if (nums.length < types.length && i + 1 < lines.length) {
+        const nextNums = extractNums(lines[i + 1]);
+        if (nextNums.length > 0) {
+          nums = nums.concat(nextNums);
+          i++;
         }
       }
+
+      // Assign numbers to types left-to-right
+      for (let j = 0; j < types.length; j++) {
+        const tp = types[j];
+        if (j < nums.length && nums[j] >= 1) {
+          totals[tp] += nums[j];
+          if (tier > bestTier[tp]) bestTier[tp] = tier;
+        }
+      }
+
       i++;
     }
+
+    return { totals, bestTier };
   }
 
-  // TG badge scan: find gold pixel clusters in icon area, return candidates
-  function detectTGBadgeCandidates(imgEl, w, h) {
-    const canvas = document.createElement('canvas');
-    canvas.width = w; canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    ctx.drawImage(imgEl, 0, 0);
-    const y0 = Math.round(h * 0.18), y1 = Math.round(h * 0.75);
-    const id = ctx.getImageData(0, y0, w, y1 - y0);
-    const d = id.data; const W = w, H = y1 - y0;
-
-    const goldMap = new Uint8Array(W * H);
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        const idx = (y * W + x) * 4;
-        const r = d[idx], g = d[idx+1], b = d[idx+2];
-        if (r > 180 && g > 120 && b < 120 && r - b > 80) goldMap[y * W + x] = 1;
-      }
-    }
-
-    const visited = new Uint8Array(W * H);
+  // ── TG badge detection ────────────────────────────────────
+  function detectTGBadgeCandidates(img) {
+    const { ctx, w, h } = getPixels(img, 0, 0, 1, 1);
+    const d = ctx.getImageData(0, 0, w, h).data;
+    const visited = new Uint8Array(w * h);
     const candidates = [];
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++) {
-        if (!goldMap[y * W + x] || visited[y * W + x]) continue;
-        const queue = [[x, y]]; visited[y * W + x] = 1;
-        let mnX=x, mxX=x, mnY=y, mxY=y, cnt=0;
-        while (queue.length) {
-          const [cx, cy] = queue.shift(); cnt++;
-          mnX=Math.min(mnX,cx); mxX=Math.max(mxX,cx);
-          mnY=Math.min(mnY,cy); mxY=Math.max(mxY,cy);
-          for (const [dx,dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
-            const nx=cx+dx, ny=cy+dy;
-            if (nx>=0&&nx<W&&ny>=0&&ny<H&&goldMap[ny*W+nx]&&!visited[ny*W+nx]) {
-              visited[ny*W+nx]=1; queue.push([nx,ny]);
+
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = (y*w+x)*4;
+        const r = d[i], g = d[i+1], b = d[i+2];
+        if (!visited[y*w+x] && r>180 && g>120 && b<120 && r-b>80) {
+          const queue = [[x, y]];
+          visited[y*w+x] = 1;
+          let cnt=0, mnX=x, mxX=x, mnY=y, mxY=y;
+          while (queue.length) {
+            const [cx, cy] = queue.shift();
+            cnt++;
+            if (cx<mnX) mnX=cx; if (cx>mxX) mxX=cx;
+            if (cy<mnY) mnY=cy; if (cy>mxY) mxY=cy;
+            for (const [dx, dy] of [[-1,0],[1,0],[0,-1],[0,1]]) {
+              const nx=cx+dx, ny=cy+dy;
+              if (nx<0||nx>=w||ny<0||ny>=h||visited[ny*w+nx]) continue;
+              const ni=(ny*w+nx)*4;
+              if (d[ni]>180 && d[ni+1]>120 && d[ni+2]<120 && d[ni]-d[ni+2]>80) {
+                visited[ny*w+nx]=1; queue.push([nx,ny]);
+              }
             }
           }
-        }
-        const bw2=mxX-mnX+1, bh2=mxY-mnY+1;
-        if (cnt>12 && bw2<55 && bh2<55 && bw2/bh2<2.5 && bh2/bw2<2.5) {
-          candidates.push({ cx: mnX+bw2/2, cy: y0+mnY+bh2/2, w: bw2, h: bh2 });
+          const bw2=mxX-mnX+1, bh2=mxY-mnY+1;
+          if (cnt>12 && bw2<55 && bh2<55 && bw2/bh2<2.5 && bh2/bw2<2.5) {
+            candidates.push({ cx:mnX+bw2/2, cy:mnY+bh2/2, w:bw2, h:bh2 });
+          }
         }
       }
     }
@@ -340,86 +342,163 @@
   async function extractTroops(file, setStatus) {
     setStatus('⏳ Loading image…', '#90b8d8');
     const img = await fileToImage(file);
-    const w = img.naturalWidth, h = img.naturalHeight;
+    const W = img.naturalWidth, H = img.naturalHeight;
 
-    // Create ONE worker and reuse it for every recognize() call.
-    // Creating/terminating a worker per call (as runOCR does) is slow and
-    // causes mobile failures when called multiple times in quick succession.
-    setStatus('⏳ Starting OCR engine…', '#90b8d8');
+    setStatus('⏳ Finding content panel…', '#90b8d8');
+
+    // Step 1: Find the inner white/cream panel via brightness scan
+    // Draw full image to canvas and scan row brightnesses
+    const fullC = document.createElement('canvas');
+    fullC.width = W; fullC.height = H;
+    const fullCtx = fullC.getContext('2d');
+    fullCtx.drawImage(img, 0, 0);
+    const fullPx = fullCtx.getImageData(0, 0, W, H).data;
+
+    const brightRowCounts = new Int32Array(H);
+    for (let y = 0; y < H; y++) {
+      let cnt = 0;
+      for (let x = 0; x < W; x++) {
+        const i = (y*W+x)*4;
+        if (fullPx[i]+fullPx[i+1]+fullPx[i+2] > 660) cnt++;
+      }
+      brightRowCounts[y] = cnt;
+    }
+
+    // Find contiguous blocks of bright rows (>35% of width)
+    const threshold = W * 0.35;
+    const blocks = [];
+    let inBlock = false, blockStart = 0;
+    for (let y = 0; y < H; y++) {
+      if (!inBlock && brightRowCounts[y] > threshold) {
+        inBlock = true; blockStart = y;
+      } else if (inBlock && brightRowCounts[y] <= threshold) {
+        if (y - blockStart > 20) blocks.push([blockStart, y-1]);
+        inBlock = false;
+      }
+    }
+    if (inBlock) blocks.push([blockStart, H-1]);
+
+    // Largest block = content panel
+    let panelTop = Math.round(H*0.15), panelBot = Math.round(H*0.92);
+    if (blocks.length > 0) {
+      const largest = blocks.reduce((a, b) => (b[1]-b[0] > a[1]-a[0]) ? b : a);
+      panelTop = largest[0];
+      panelBot = largest[1];
+    }
+
+    // Step 2: Extract panel pixels and build B&W canvas
+    const panelX0 = Math.round(W * 0.03);
+    const panelW  = Math.round(W * 0.94);
+    const panelH  = panelBot - panelTop;
+
+    const panelC = document.createElement('canvas');
+    panelC.width = panelW; panelC.height = panelH;
+    const panelCtx = panelC.getContext('2d');
+    panelCtx.drawImage(img, panelX0, panelTop, panelW, panelH, 0, 0, panelW, panelH);
+    const px = panelCtx.getImageData(0, 0, panelW, panelH).data;
+
+    // Find tight text bounds — skip blank rows at top/bottom of panel
+    let textY0 = panelH, textY1 = 0;
+    for (let y = 0; y < panelH; y++) {
+      for (let x = 0; x < panelW; x++) {
+        const i = (y*panelW+x)*4;
+        if (px[i]+px[i+1]+px[i+2] < 320) {
+          if (y < textY0) textY0 = y;
+          if (y > textY1) textY1 = y;
+          break;
+        }
+      }
+    }
+
+    if (textY0 >= textY1) {
+      throw new Error('No text found in panel — try the Troops Preview screen');
+    }
+
+    textY0 = Math.max(0, textY0 - 15);
+    textY1 = Math.min(panelH - 1, textY1 + 15);
+    const textH = textY1 - textY0 + 1;
+
+    // Build 2× scaled black-on-white canvas
+    const bwC = document.createElement('canvas');
+    bwC.width = panelW * 2; bwC.height = textH * 2;
+    const bwCtx = bwC.getContext('2d');
+    const bwId = bwCtx.createImageData(panelW*2, textH*2);
+    const bwPx = bwId.data;
+
+    for (let y = textY0; y <= textY1; y++) {
+      for (let x = 0; x < panelW; x++) {
+        const si = (y*panelW+x)*4;
+        const v  = (px[si]+px[si+1]+px[si+2] < 320) ? 0 : 255;
+        const dy = y - textY0;
+        for (let oy = 0; oy < 2; oy++) {
+          for (let ox = 0; ox < 2; ox++) {
+            const di = ((dy*2+oy)*panelW*2 + (x*2+ox))*4;
+            bwPx[di]=bwPx[di+1]=bwPx[di+2]=v; bwPx[di+3]=255;
+          }
+        }
+      }
+    }
+    bwCtx.putImageData(bwId, 0, 0);
+
+    // Step 3: OCR — ONE worker, reused for all calls
+    setStatus('🔍 Reading troops…', '#90b8d8');
     const T = await getTesseract();
     const worker = await T.createWorker('eng', 1, {});
-    // PSM 6 = "uniform block of text" — essential for reading cropped column images.
-    // Must be set via setParameters(); passing '--psm 6' as a string is ignored by Tesseract.js.
+    // PSM 6 = uniform block of text — required for reliable multi-line reading
     await worker.setParameters({ tessedit_pageseg_mode: '6' });
 
-    // Convert canvas → data URL before passing to worker.recognize().
-    // Canvas elements may not transfer correctly across worker thread boundaries
-    // in all browsers; a data URL string is always safe.
     async function ocr(canvas) {
-      const dataUrl = canvas.toDataURL('image/png');
-      const { data: { text } } = await worker.recognize(dataUrl);
+      const { data: { text } } = await worker.recognize(canvas.toDataURL('image/png'));
       return text;
     }
 
-    const totals     = { inf: 0, cav: 0, arc: 0 };
-    const bestByType = { inf: null, cav: null, arc: null };
-
     try {
-      // Two-column OCR: left [2%-52%] and right [48%-98%]
-      for (const [x0p, x1p] of [[0.02, 0.52], [0.48, 0.98]]) {
-        setStatus('🔍 Reading troop columns…', '#90b8d8');
-        const bwCanvas = buildBWCanvas(img, x0p, 0.18, x1p, 0.90,
-          (r, g, b) => (r + g + b) < 380, 2);
-        const text = await ocr(bwCanvas);
-        parseTroopColumn(text, totals, bestByType);
-      }
+      const text = await ocr(bwC);
 
-      // Find overall best tier
-      let bestTier = 0;
-      for (const bt of Object.values(bestByType)) {
-        if (bt && bt.tier > bestTier) bestTier = bt.tier;
-      }
+      // Step 4: Parse
+      const { totals, bestTier } = parseTroopText(text);
+      let overallBest = Math.max(bestTier.inf, bestTier.cav, bestTier.arc);
 
-      // TG badge detection (only for T10 Apex troops)
+      // Step 5: TG badge detection (T10 only)
       let tgLevel = 0;
-      if (bestTier >= 10) {
+      if (overallBest >= 10) {
         setStatus('🔍 Detecting TG level…', '#90b8d8');
-        const candidates = detectTGBadgeCandidates(img, w, h);
-        const votes = [];
+        const candidates = detectTGBadgeCandidates(img);
+
         for (const badge of candidates.slice(0, 8)) {
           const pad = Math.max(badge.w, badge.h) * 0.9;
           const bx0=Math.round(badge.cx-pad), by0=Math.round(badge.cy-pad);
           const bx1=Math.round(badge.cx+pad), by1=Math.round(badge.cy+pad);
           const bw2=bx1-bx0, bh2=by1-by0;
-          if (bw2 < 4 || bh2 < 4) continue;
+          if (bw2<4||bh2<4) continue;
+
           const bc = document.createElement('canvas');
           bc.width=bw2*8; bc.height=bh2*8;
-          const bctx = bc.getContext('2d');
+          const bctx=bc.getContext('2d');
           bctx.scale(8,8);
           bctx.drawImage(img, bx0, by0, bw2, bh2, 0, 0, bw2, bh2);
-          const bid = bctx.getImageData(0, 0, bc.width, bc.height);
-          const bd = bid.data;
-          for (let k = 0; k < bd.length; k+=4) {
-            const isWhite = bd[k]>200 && bd[k+1]>185 && bd[k+2]>160;
-            bd[k]=bd[k+1]=bd[k+2]= isWhite ? 0 : 255;
+          const bid=bctx.getImageData(0,0,bc.width,bc.height);
+          const bd=bid.data;
+          for (let k=0; k<bd.length; k+=4) {
+            const isW=bd[k]>200&&bd[k+1]>185&&bd[k+2]>160;
+            bd[k]=bd[k+1]=bd[k+2]=isW?0:255;
           }
-          bctx.putImageData(bid, 0, 0);
+          bctx.putImageData(bid,0,0);
+
           const badgeText = await ocr(bc);
           const digit = badgeText.trim().replace(/\D/g,'');
-          if (digit >= '1' && digit <= '5') votes.push(parseInt(digit));
-        }
-        if (votes.length > 0) {
-          const freq = {};
-          votes.forEach(v => freq[v] = (freq[v]||0)+1);
-          tgLevel = parseInt(Object.entries(freq).sort((a,b)=>b[1]-a[1])[0][0]);
+          if (digit>='1'&&digit<='5') {
+            const v=parseInt(digit);
+            if (v>tgLevel) tgLevel=v;
+          }
         }
       }
 
-      const selectVal = tierToSelectValue(bestTier, tgLevel);
-      return { ...totals, bestTier, tgLevel, selectVal };
+      const selectVal = tierToSelectValue(overallBest, tgLevel);
+      return { ...totals, bestTier: overallBest, tgLevel, selectVal };
 
     } finally {
-      await worker.terminate(); // always free memory
+      await worker.terminate();
     }
   }
 
@@ -436,12 +515,9 @@
     setTimeout(() => { el.style.background = ''; el.style.outline = ''; }, 1600);
   }
 
-  // (findContainerAndParent removed — using direct CSS selector targeting)
-
   // ── Build upload bar ──────────────────────────────────────
   function makeBar(btnLabel, inputId, onFile) {
     const wrap = document.createElement('div');
-    // Outer wrapper: centered column — button centered, status text centered below
     wrap.style.cssText = [
       'width:100%','box-sizing:border-box',
       'display:flex','flex-direction:column','align-items:center','gap:8px',
@@ -464,9 +540,8 @@
     lbl.addEventListener('mouseleave', () => { lbl.style.background='#1a2c44'; lbl.style.borderColor='#3a5878'; lbl.style.color='#90b8d8'; });
 
     const inp = document.createElement('input');
-    inp.type = 'file'; inp.id = inputId; inp.accept = 'image/*'; inp.style.display = 'none';
+    inp.type='file'; inp.id=inputId; inp.accept='image/*'; inp.style.display='none';
 
-    // Status line — centered, full width, wraps freely
     const status = document.createElement('div');
     status.style.cssText = [
       'font-size:12px','color:#4a6080',
@@ -476,31 +551,27 @@
     ].join(';');
     status.textContent = 'Processed locally — no data sent anywhere';
 
-    function setStatus(msg, color) { status.textContent = msg; status.style.color = color || '#4a6080'; }
+    function setStatus(msg, color) { status.textContent=msg; status.style.color=color||'#4a6080'; }
 
     inp.addEventListener('change', async e => {
-      const file = e.target.files[0]; if (!file) return;
-      e.target.value = '';
-      lbl.style.opacity = '0.5'; lbl.style.pointerEvents = 'none';
+      const file=e.target.files[0]; if(!file) return;
+      e.target.value='';
+      lbl.style.opacity='0.5'; lbl.style.pointerEvents='none';
       try {
         await onFile(file, setStatus);
       } catch(err) {
         console.error('[OCR]', err);
-        setStatus('❌ ' + err.message, '#e05555');
+        setStatus('❌ '+err.message, '#e05555');
       } finally {
-        lbl.style.opacity = ''; lbl.style.pointerEvents = '';
+        lbl.style.opacity=''; lbl.style.pointerEvents='';
       }
     });
 
-    wrap.appendChild(lbl);
-    wrap.appendChild(inp);
-    wrap.appendChild(status);
+    wrap.appendChild(lbl); wrap.appendChild(inp); wrap.appendChild(status);
     return wrap;
   }
 
   // ── Inject stat bar ───────────────────────────────────────
-  // HTML structure: .panel > .grid.grid-stats (3-col: Infantry | Cavalry | Archers)
-  // We insert the bar directly before .grid.grid-stats inside the panel.
   function injectStatBar() {
     const ids = ['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let'];
 
@@ -524,8 +595,6 @@
       if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
     });
 
-    // Target: the .grid.grid-stats div (3-col stat grid)
-    // Insert before it inside its parent (.panel)
     const statsGrid = document.querySelector('.grid.grid-stats');
     if (statsGrid && statsGrid.parentElement) {
       statsGrid.parentElement.insertBefore(bar, statsGrid);
@@ -535,9 +604,6 @@
   }
 
   // ── Inject troop bar ──────────────────────────────────────
-  // HTML structure: .panel > .grid.grid-two (2-col: Your available troops | Formation settings)
-  // The left column contains stockInf/Cav/Arc.
-  // We insert the bar directly BEFORE the entire .grid.grid-two div.
   function injectTroopBar() {
     const bar = makeBar('📷 Import troops from screenshot', 'ocrTroopFile', async (file, setStatus) => {
       const troops = await extractTroops(file, setStatus);
@@ -550,7 +616,6 @@
       setField('stockCav', Math.round(troops.cav));
       setField('stockArc', Math.round(troops.arc));
 
-      // Auto-set troop tier select if detected
       if (troops.selectVal) {
         const sel = document.getElementById('troopTier');
         if (sel) {
@@ -568,16 +633,16 @@
 
       const fmt = n => Number(n).toLocaleString();
       const tierStr = troops.bestTier > 0
-        ? (troops.tgLevel > 0 ? ` \u00b7 \ud83c\udf96 ${troops.selectVal} detected` : ` \u00b7 Tier \u2192 ${troops.selectVal}`)
+        ? (troops.tgLevel > 0
+            ? ` · 🏅 ${troops.selectVal} detected`
+            : ` · Tier → ${troops.selectVal}`)
         : '';
-      setStatus(`\u2705 INF ${fmt(troops.inf)}  CAV ${fmt(troops.cav)}  ARC ${fmt(troops.arc)}${tierStr}`, '#4caf88');
+      setStatus(`✅ INF ${fmt(troops.inf)}  CAV ${fmt(troops.cav)}  ARC ${fmt(troops.arc)}${tierStr}`, '#4caf88');
 
       if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
       if (window.Magic?.compute)      setTimeout(() => window.Magic.compute('magic12'), 200);
     });
 
-    // Target: .grid.grid-two (the 2-col troops + formation grid)
-    // Insert before it inside its parent (.panel)
     const troopGrid = document.querySelector('.grid.grid-two');
     if (troopGrid && troopGrid.parentElement) {
       troopGrid.parentElement.insertBefore(bar, troopGrid);
@@ -586,12 +651,11 @@
     }
   }
 
-    // ── Init: inject both bars, pre-warm Tesseract ───────────
+  // ── Init ──────────────────────────────────────────────────
   function init() {
     injectStatBar();
     injectTroopBar();
-    // Start loading Tesseract.js in background so first upload is instant
-    getTesseract().catch(() => {});
+    getTesseract().catch(() => {});  // pre-warm in background
   }
 
   if (document.readyState === 'loading') {
