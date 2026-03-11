@@ -284,12 +284,17 @@
     setTimeout(() => { el.style.background = ''; el.style.outline = ''; }, 1600);
   }
 
-  function findContainer(ids) {
+  // Returns the innermost element containing all IDs, and its parent.
+  // Bar gets inserted as parent.insertBefore(bar, grid) — sits ABOVE the grid,
+  // never inside it, so it cannot disrupt column/flex layout.
+  function findContainerAndParent(ids) {
     const first = document.getElementById(ids[0]);
     if (!first) return null;
     let el = first.parentElement;
     while (el) {
-      if (ids.every(id => el.querySelector('#' + id))) return el;
+      if (ids.every(id => el.querySelector('#' + id))) {
+        return { grid: el, parent: el.parentElement || el };
+      }
       el = el.parentElement;
     }
     return null;
@@ -349,8 +354,9 @@
   // ── Inject stat bar ───────────────────────────────────────
   function injectStatBar() {
     const ids = ['inf_atk','inf_let','cav_atk','cav_let','arc_atk','arc_let'];
-    const container = findContainer(ids);
-    if (!container) { console.warn('[OCR] stat container not found'); return; }
+    const found = findContainerAndParent(ids);
+    if (!found) { console.warn('[OCR] stat container not found'); return; }
+    const { grid, parent } = found;
 
     const bar = makeBar('📷 Import stats from screenshot', 'ocrStatFile', async (file, setStatus) => {
       const stats = await extractStats(file, setStatus);
@@ -372,14 +378,16 @@
       if (window.OptionA?.computeAll) setTimeout(() => window.OptionA.computeAll(), 150);
     });
 
-    container.insertBefore(bar, container.firstChild);
+    // Insert BEFORE the grid — above it, not inside it
+    parent.insertBefore(bar, grid);
   }
 
   // ── Inject troop bar ──────────────────────────────────────
   function injectTroopBar() {
     const ids = ['stockInf','stockCav','stockArc'];
-    const container = findContainer(ids);
-    if (!container) { console.warn('[OCR] troop container not found'); return; }
+    const found = findContainerAndParent(ids);
+    if (!found) { console.warn('[OCR] troop container not found'); return; }
+    const { grid, parent } = found;
 
     const bar = makeBar('📷 Import troops from screenshot', 'ocrTroopFile', async (file, setStatus) => {
       const troops = await extractTroops(file, setStatus);
@@ -399,7 +407,8 @@
       if (window.Magic?.compute)      setTimeout(() => window.Magic.compute('magic12'), 200);
     });
 
-    container.insertBefore(bar, container.firstChild);
+    // Insert BEFORE the grid — above it, not inside it
+    parent.insertBefore(bar, grid);
   }
 
   // ── Init: inject both bars, pre-warm Tesseract ───────────
