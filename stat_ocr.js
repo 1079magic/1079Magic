@@ -329,8 +329,9 @@
   // ── Main troop extraction ─────────────────────────────────
   async function extractTroops(file, setStatus) {
     setStatus('⏳ Loading image…', '#90b8d8');
+    // fileToImage returns a raw HTMLImageElement (same as extractStats uses)
     const img = await fileToImage(file);
-    const { w, h } = img;
+    const w = img.naturalWidth, h = img.naturalHeight;
 
     const totals     = { inf: 0, cav: 0, arc: 0 };
     const bestByType = { inf: null, cav: null, arc: null };
@@ -338,9 +339,10 @@
     // Two-column OCR: left [2%-52%] and right [48%-98%]
     for (const [x0p, x1p] of [[0.02, 0.52], [0.48, 0.98]]) {
       setStatus('🔍 Reading troop columns…', '#90b8d8');
-      const bw = buildBWCanvas(img, x0p, 0.18, x1p, 0.90,
+      // buildBWCanvas takes the raw HTMLImageElement directly
+      const bwCanvas = buildBWCanvas(img, x0p, 0.18, x1p, 0.90,
         (r, g, b) => (r + g + b) < 380, 2);
-      const text = await runOCR(bw, '--psm 6', null);
+      const text = await runOCR(bwCanvas, '--psm 6', null);
       parseTroopColumn(text, totals, bestByType);
     }
 
@@ -354,7 +356,8 @@
     let tgLevel = 0;
     if (bestTier >= 10) {
       setStatus('🔍 Detecting TG level…', '#90b8d8');
-      const candidates = detectTGBadgeCandidates(img.el, w, h);
+      // img is HTMLImageElement — pass directly
+      const candidates = detectTGBadgeCandidates(img, w, h);
       const votes = [];
       for (const badge of candidates.slice(0, 8)) {
         const pad = Math.max(badge.w, badge.h) * 0.9;
@@ -363,12 +366,12 @@
         const bw2=bx1-bx0, bh2=by1-by0;
         if (bw2 < 4 || bh2 < 4) continue;
 
-        // Crop badge area from original image, isolate white digit on gold
+        // Crop badge area, isolate white digit on gold background
         const bc = document.createElement('canvas');
         bc.width=bw2*8; bc.height=bh2*8;
         const bctx = bc.getContext('2d');
         bctx.scale(8,8);
-        bctx.drawImage(img.el, bx0, by0, bw2, bh2, 0, 0, bw2, bh2);
+        bctx.drawImage(img, bx0, by0, bw2, bh2, 0, 0, bw2, bh2);
         const bid = bctx.getImageData(0, 0, bc.width, bc.height);
         const bd = bid.data;
         for (let k = 0; k < bd.length; k+=4) {
