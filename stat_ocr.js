@@ -165,14 +165,94 @@
     return results;
   }
 
+  /**
+   * Find the Bonus Details table region by scanning for the characteristic
+   * light-beige/cream rows of the stat table. Returns [y0f, y1f] fractions.
+   * Falls back to full image if not found.
+   * Also detects and crops away black phone-frame borders (gallery/browser screenshots).
+   */
+  function findBonusDetailsRegion(img) {
+    const W = img.naturalWidth, H = img.naturalHeight;
+    const { ctx } = getPixels(img, 0, 0, 1, 1);
+    const px = ctx.getImageData(0, 0, W, H).data;
+
+    // Step 1: Detect content bounds — crop away black phone frame borders.
+    // Scan from each edge inward to find where non-black pixels begin.
+    const BLACK = 40; // threshold: pixels darker than this are frame border
+    let left = 0, right = W - 1, top = 0, bottom = H - 1;
+
+    // Find left edge
+    outer: for (let x = 0; x < W; x++) {
+      for (let y = 0; y < H; y++) {
+        const i = (y * W + x) * 4;
+        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { left = x; break outer; }
+      }
+    }
+    // Find right edge
+    outer: for (let x = W - 1; x >= 0; x--) {
+      for (let y = 0; y < H; y++) {
+        const i = (y * W + x) * 4;
+        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { right = x; break outer; }
+      }
+    }
+    // Find top edge
+    outer: for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { top = y; break outer; }
+      }
+    }
+    // Find bottom edge
+    outer: for (let y = H - 1; y >= 0; y--) {
+      for (let x = 0; x < W; x++) {
+        const i = (y * W + x) * 4;
+        if (px[i] > BLACK || px[i+1] > BLACK || px[i+2] > BLACK) { bottom = y; break outer; }
+      }
+    }
+
+    // Step 2: Within the content area, find the Bonus Details table.
+    // The table rows alternate light-beige (R>200, G>185, B>165) across
+    // at least 50% of the content width. Scan row by row.
+    const cw = right - left + 1;
+    const threshold = cw * 0.4;
+    let tableTop = -1, tableBottom = -1;
+    let inTable = false;
+
+    for (let y = top; y <= bottom; y++) {
+      let beigeCount = 0;
+      for (let x = left; x <= right; x++) {
+        const i = (y * W + x) * 4;
+        const r = px[i], g = px[i+1], b = px[i+2];
+        if (r > 195 && g > 180 && b > 155 && r - b < 70) beigeCount++;
+      }
+      const isTableRow = beigeCount > threshold;
+      if (!inTable && isTableRow) { inTable = true; tableTop = y; }
+      if (inTable && !isTableRow && y - tableTop > 30) { tableBottom = y; break; }
+    }
+    if (tableTop < 0) return [top / H, bottom / H, left / W, right / W];
+    if (tableBottom < 0) tableBottom = bottom;
+
+    // Add a small margin
+    const margin = Math.round((tableBottom - tableTop) * 0.05);
+    return [
+      Math.max(0, (tableTop - margin)) / H,
+      Math.min(1, (tableBottom + margin)) / H,
+      left / W,
+      right / W,
+    ];
+  }
+
   async function extractStats(file, setStatus) {
     setStatus('⏳ Loading image…', '#a0b4d0');
     const img = await fileToImage(file);
     setStatus('🔍 Reading stats…', '#a0b4d0');
 
-    // Full-image pass, but color-filtered: green pixels → white (invisible to OCR)
-    // This works regardless of image width, portrait vs landscape, overlay elements.
-    const bw = buildBWCanvas(img, 0, 0, 1, 1, isStatTextPixel, 2);
+    // Find the Bonus Details table region (handles phone-frame/browser screenshots)
+    const [y0f, y1f, x0f, x1f] = findBonusDetailsRegion(img);
+
+    // Build color-filtered canvas: red+black pixels kept, green excluded.
+    // Use higher scale (3×) so tiny/thumbnail images still OCR reliably.
+    const bw = buildBWCanvas(img, x0f, y0f, x1f, y1f, isStatTextPixel, 3);
     const text = await runOCR(bw, 6, null);
     return parseStatsFromText(text);
   }
@@ -349,14 +429,22 @@
   //
   // We detect the gold circle (top-left) and OCR the Arabic digit inside.
 
-  function detectGoldBadgeCandidates(img) {
+  // panelY0/panelY1: pixel Y bounds of the cream troop panel.
+  // We only search within the top 80% of that panel — TG badges are on
+  // hex icons, while the Formations button and tier-ring badges (gold
+  // ring around the X Roman numeral at the bottom of each icon) sit in
+  // the lower portion and would otherwise produce false-positive reads.
+  function detectGoldBadgeCandidates(img, panelY0, panelY1) {
     const W = img.naturalWidth, H = img.naturalHeight;
+    // Clamp search area: top 80% of panel, exclude image edges
+    const scanY0 = Math.round(panelY0);
+    const scanY1 = Math.round(panelY0 + (panelY1 - panelY0) * 0.80);
     const { ctx } = getPixels(img, 0, 0, 1, 1);
     const d = ctx.getImageData(0, 0, W, H).data;
     const visited = new Uint8Array(W * H);
     const candidates = [];
 
-    for (let y = 0; y < H; y++) {
+    for (let y = scanY0; y < scanY1; y++) {
       for (let x = 0; x < W; x++) {
         const idx = y * W + x;
         if (visited[idx]) continue;
@@ -391,8 +479,10 @@
 
         const bw = mxX - mnX + 1, bh = mxY - mnY + 1;
         const aspect = bw / Math.max(bh, 1);
-        // Filter: small badge size, roughly circular
-        if (cnt >= 10 && bw <= 55 && bh <= 55 && aspect >= 0.4 && aspect <= 2.5) {
+        // Real TG badge: small (≤40px wide/tall), roughly circular, pixel
+        // count ≤300. The tier-ring (around Roman X) is far larger (cnt>>300)
+        // and the hex border ring is also too big. This keeps only real badges.
+        if (cnt >= 8 && cnt <= 300 && bw <= 40 && bh <= 40 && aspect >= 0.5 && aspect <= 2.0) {
           candidates.push({ cx: mnX + bw/2, cy: mnY + bh/2, w: bw, h: bh, cnt });
         }
       }
@@ -438,13 +528,13 @@
     return 0;
   }
 
-  async function detectTGLevel(img, setStatus) {
+  async function detectTGLevel(img, setStatus, panelY0px, panelY1px) {
     setStatus('🔍 Detecting TG level…', '#90b8d8');
-    const candidates = detectGoldBadgeCandidates(img);
+    const candidates = detectGoldBadgeCandidates(img, panelY0px, panelY1px);
     if (candidates.length === 0) return 0;
 
-    // Sort by cluster size (larger gold blobs = more reliable badges), top 8
-    const top = candidates.sort((a, b) => b.cnt - a.cnt).slice(0, 8);
+    // Sort by largest cluster first (more pixels = more reliable), top 6 only
+    const top = candidates.sort((a, b) => b.cnt - a.cnt).slice(0, 6);
     let maxTG = 0;
     for (const badge of top) {
       const digit = await readBadgeDigit(img, badge);
@@ -490,7 +580,9 @@
     // TG badge detection only meaningful for T10 (Apex) troops
     let tgLevel = 0;
     if (archerTier >= 10) {
-      tgLevel = await detectTGLevel(img, setStatus);
+      const H = img.naturalHeight;
+      tgLevel = await detectTGLevel(img, setStatus,
+        Math.round(ytop * H), Math.round(ybot * H));
     }
 
     return {
