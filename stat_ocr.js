@@ -154,36 +154,37 @@
   /**
    * Extract a stat value from a single text line.
    *
-   * Handles the actual Tesseract output artifacts observed on real screenshots:
+   * Handles all Tesseract output artifacts observed on real screenshots:
    *
-   * 1. Standard:   "+412.7% Cavalry Attack"    → 412.7
-   * 2. Comma dec:  "+412,7%"                   → 412.7
-   * 3. Garbled '+': "<< 1412.7% Cavalry Attack —-+80.9% »"
-   *                The left nav arrow causes Tesseract to OCR '+' as '1',
-   *                giving "1412.7" instead of "+412.7". Detected by value ≥ 1000
-   *                (all real game stats are 100–999.9), then strip leading digit.
-   * 4. Decimal dropped: "+4515%" → 451.5 (4 raw digits → NNN.N)
+   * 1. Standard:    "+412.7% Cavalry Attack"         → 412.7
+   * 2. Comma dec:   "+412,7%"                        → 412.7
+   * 3. Garbled '+': "<< 1412.7% Cavalry Attack »"
+   *                 The left nav arrow causes Tesseract to OCR '+' as '1',
+   *                 giving "1412.7". Detected by value ≥ 1000 (no real game
+   *                 stat exceeds 999.9%), then leading digit is stripped.
+   * 4. Arrow as letters: "cc 1412.7% Cavalry Attack" — Tesseract.js (browser)
+   *                 may render '<<' as 'cc', 'ce', or similar letter pairs.
+   * 5. Decimal dropped: "+4515%" → 451.5 (4 raw digits → NNN.N)
    *
-   * Always strips leading pipe/arrow/bracket noise before matching,
-   * and only matches the LEFTMOST number on the line (stat value is
-   * always left of the stat name; right-column green values are ignored).
+   * Strategy: skip ALL leading non-digit/non-plus characters (handles any
+   * arrow rendering variant), then match the first number from that position.
    */
   function parseStatValue(line) {
-    // Strip leading noise chars (|, <, >, «, », !, spaces)
-    const s = line.replace(/^[\s|!<>«»]+/, '');
+    // Advance past any leading noise to the first '+' or digit
+    const start = line.search(/[+\d]/);
+    if (start < 0) return null;
+    const s = line.slice(start);
 
-    // Primary: match first number (with optional + prefix) + decimal
+    // Primary: +NNN.N or NNN.N (with or without + prefix)
     let m = s.match(/^\+?(\d{1,4})[.,](\d)/);
     if (m) {
       let val = parseFloat(`${m[1]}.${m[2]}`);
-      // If ≥ 1000, leading digit is a garbled '+' (e.g. "1412.7" → 412.7)
-      if (val >= 1000 && m[1].length === 4) {
-        val = parseFloat(`${m[1].slice(1)}.${m[2]}`);
-      }
+      // ≥ 1000 means the leading digit is a garbled '+' — strip it
+      if (val >= 1000 && m[1].length === 4) val = parseFloat(`${m[1].slice(1)}.${m[2]}`);
       if (val >= 100 && val < 1000) return val;
     }
 
-    // Fallback: decimal dropped by OCR — 4 raw digits = NNN.N
+    // Fallback: decimal dropped by OCR — 4 raw digits treated as NNN.N
     m = s.match(/^\+?(\d{3})(\d)(?!\d)/);
     if (m) {
       const val = parseFloat(`${m[1]}.${m[2]}`);
